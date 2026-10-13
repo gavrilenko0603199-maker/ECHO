@@ -18,7 +18,13 @@ import {
   X,
   Check,
   PhoneIncoming,
-  PhoneOff
+  PhoneOff,
+  LogOut,
+  Mail,
+  LockKeyhole,
+  UserRound,
+  Eye,
+  EyeOff
 } from 'lucide-react';
 import { Room, RoomEvent, Track } from 'livekit-client';
 import './App.css';
@@ -26,6 +32,7 @@ import './App.css';
 type Contact = {
   id: string;
   name: string;
+  email?: string;
   online?: boolean;
   status?: string;
   color: string;
@@ -33,13 +40,26 @@ type Contact = {
 };
 
 type CallHistoryItem = {
-  id: number;
+  id: string | number;
   name: string;
   time: string;
   duration: string;
   type: 'incoming' | 'outgoing' | 'missed';
   color: string;
   initials: string;
+};
+
+type ServerHistoryItem = {
+  id: string;
+  callId: string;
+  otherUserId: string;
+  name: string;
+  status: string;
+  type: 'incoming' | 'outgoing' | 'missed';
+  direction: 'incoming' | 'outgoing';
+  createdAt: string;
+  endedAt: string | null;
+  durationSeconds: number;
 };
 
 type ServerCall = {
@@ -62,6 +82,18 @@ type ServerState = {
   activeCall: ServerCall | null;
 };
 
+type AuthResponse = {
+  user: {
+    id: string;
+    name: string;
+    email: string;
+    online?: boolean;
+  };
+  token: string;
+};
+
+type AuthMode = 'login' | 'register';
+
 type CallStatus =
   | 'idle'
   | 'ringing'
@@ -70,6 +102,7 @@ type CallStatus =
   | 'error';
 
 const API_URL = 'https://echo-mufe.onrender.com';
+const TOKEN_KEY = 'echo-auth-token';
 
 const avatarColors = [
   '#8B78F6',
@@ -108,13 +141,57 @@ function contactFromServer(user: Contact): Contact {
   };
 }
 
+function formatCallDuration(seconds: number) {
+  if (seconds <= 0) return '00:00';
+
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+
+  return `${minutes.toString().padStart(2, '0')}:${remainingSeconds
+    .toString()
+    .padStart(2, '0')}`;
+}
+
+function formatCallTime(value: string) {
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) return 'Дата неизвестна';
+
+  const now = new Date();
+  const isToday = date.toDateString() === now.toDateString();
+
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+
+  const isYesterday = date.toDateString() === yesterday.toDateString();
+
+  const time = date.toLocaleTimeString('ru-RU', {
+    hour: '2-digit',
+    minute: '2-digit'
+  });
+
+  if (isToday) return `Сегодня, ${time}`;
+  if (isYesterday) return `Вчера, ${time}`;
+
+  return `${date.toLocaleDateString('ru-RU', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric'
+  })}, ${time}`;
+}
+
 async function postJson<T>(
   path: string,
   body: Record<string, unknown>
 ): Promise<T> {
+  const token = localStorage.getItem(TOKEN_KEY);
+
   const response = await fetch(`${API_URL}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {})
+    },
     body: JSON.stringify(body)
   });
 
@@ -129,6 +206,41 @@ async function postJson<T>(
   }
 
   return data as T;
+}
+
+async function getJson<T>(path: string): Promise<T> {
+  const token = localStorage.getItem(TOKEN_KEY);
+
+  const response = await fetch(`${API_URL}${path}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {}
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    throw new Error(
+      typeof data.error === 'string'
+        ? data.error
+        : `Ошибка сервера (${response.status})`
+    );
+  }
+
+  return data as T;
+}
+
+function mapServerHistory(item: ServerHistoryItem): CallHistoryItem {
+  return {
+    id: item.id,
+    name: item.name || 'Пользователь',
+    time: formatCallTime(item.endedAt || item.createdAt),
+    duration:
+      item.type === 'missed'
+        ? 'Не отвечен'
+        : formatCallDuration(item.durationSeconds || 0),
+    type: item.type,
+    color: colorOf(item.otherUserId || item.id),
+    initials: initialsOf(item.name || 'Пользователь')
+  };
 }
 
 function Avatar({
@@ -153,7 +265,426 @@ function Avatar({
   );
 }
 
+function AuthScreen({
+  mode,
+  setMode,
+  onAuthenticated
+}: {
+  mode: AuthMode;
+  setMode: (mode: AuthMode) => void;
+  onAuthenticated: (result: AuthResponse) => void;
+}) {
+  const [name, setName] = useState('');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const isRegister = mode === 'register';
+
+  async function submit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError('');
+
+    if (isRegister && name.trim().length < 2) {
+      setError('Имя должно содержать минимум 2 символа.');
+      return;
+    }
+
+    if (isRegister && password !== confirmPassword) {
+      setError('Пароли не совпадают.');
+      return;
+    }
+
+    if (password.length < 8) {
+      setError('Пароль должен содержать минимум 8 символов.');
+      return;
+    }
+
+    setBusy(true);
+
+    try {
+      const result = await postJson<AuthResponse>(
+        isRegister ? '/api/auth/register' : '/api/auth/login',
+        isRegister
+          ? {
+              name: name.trim(),
+              email: email.trim().toLowerCase(),
+              password
+            }
+          : {
+              email: email.trim().toLowerCase(),
+              password
+            }
+      );
+
+      if (!result.token || !result.user?.id) {
+        throw new Error('Сервер вернул неполные данные аккаунта.');
+      }
+
+      localStorage.setItem(TOKEN_KEY, result.token);
+      localStorage.setItem('echo-display-name', result.user.name);
+
+      onAuthenticated(result);
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'Не удалось выполнить запрос. Попробуй ещё раз.'
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const fieldStyle: React.CSSProperties = {
+    width: '100%',
+    height: 46,
+    boxSizing: 'border-box',
+    padding: '0 14px 0 43px',
+    borderRadius: 12,
+    border: '1px solid #343447',
+    background: '#171722',
+    color: '#F5F5FC',
+    fontSize: 14,
+    outline: 'none'
+  };
+
+  const labelStyle: React.CSSProperties = {
+    display: 'block',
+    color: '#D7D7E6',
+    fontSize: 13,
+    fontWeight: 600,
+    marginBottom: 8
+  };
+
+  return (
+    <div
+      style={{
+        minHeight: '100vh',
+        width: '100%',
+        boxSizing: 'border-box',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: 24,
+        overflowY: 'auto',
+        background:
+          'radial-gradient(ellipse at 15% 15%, #302453 0%, transparent 42%), radial-gradient(ellipse at 85% 85%, #1b3540 0%, transparent 40%), #101018',
+        color: '#F5F5FC',
+        fontFamily: 'inherit'
+      }}
+    >
+      <div
+        style={{
+          width: '100%',
+          maxWidth: 420,
+          padding: '36px 34px',
+          boxSizing: 'border-box',
+          borderRadius: 24,
+          border: '1px solid #343044',
+          background: 'rgba(22, 22, 33, 0.96)',
+          boxShadow: '0 24px 100px #00000055'
+        }}
+      >
+        <div style={{ textAlign: 'center', marginBottom: 30 }}>
+          <div
+            style={{
+              width: 58,
+              height: 58,
+              borderRadius: 18,
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              background: 'linear-gradient(135deg, #8B78F6, #6550D9)',
+              boxShadow: '0 8px 30px #8B78F633',
+              marginBottom: 16
+            }}
+          >
+            <AudioLines size={29} color="white" strokeWidth={2.3} />
+          </div>
+
+          <h1
+            style={{
+              margin: '0 0 8px',
+              fontSize: 32,
+              letterSpacing: '-1.5px',
+              fontWeight: 800
+            }}
+          >
+            echo
+          </h1>
+
+          <p
+            style={{
+              margin: 0,
+              color: '#9B9BAF',
+              fontSize: 14,
+              lineHeight: 1.6
+            }}
+          >
+            {isRegister
+              ? 'Создай аккаунт и оставайся на связи.'
+              : 'Рады снова тебя видеть.'}
+          </p>
+        </div>
+
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: '1fr 1fr',
+            padding: 4,
+            gap: 4,
+            borderRadius: 13,
+            background: '#11111A',
+            marginBottom: 25
+          }}
+        >
+          <button
+            type="button"
+            onClick={() => {
+              setError('');
+              setMode('login');
+            }}
+            style={{
+              height: 39,
+              border: 0,
+              borderRadius: 10,
+              cursor: 'pointer',
+              color: !isRegister ? '#FFFFFF' : '#9090A4',
+              background: !isRegister ? '#302B49' : 'transparent',
+              fontSize: 13,
+              fontWeight: 700
+            }}
+          >
+            Вход
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setError('');
+              setMode('register');
+            }}
+            style={{
+              height: 39,
+              border: 0,
+              borderRadius: 10,
+              cursor: 'pointer',
+              color: isRegister ? '#FFFFFF' : '#9090A4',
+              background: isRegister ? '#302B49' : 'transparent',
+              fontSize: 13,
+              fontWeight: 700
+            }}
+          >
+            Регистрация
+          </button>
+        </div>
+
+        <form onSubmit={(event) => void submit(event)}>
+          {isRegister && (
+            <div style={{ marginBottom: 17 }}>
+              <label style={labelStyle}>Имя пользователя</label>
+              <div style={{ position: 'relative' }}>
+                <UserRound
+                  size={18}
+                  color="#85859D"
+                  style={{
+                    position: 'absolute',
+                    left: 14,
+                    top: 14
+                  }}
+                />
+                <input
+                  value={name}
+                  onChange={(event) => setName(event.target.value)}
+                  placeholder="Как тебя называть?"
+                  autoComplete="name"
+                  maxLength={48}
+                  required
+                  style={fieldStyle}
+                />
+              </div>
+            </div>
+          )}
+
+          <div style={{ marginBottom: 17 }}>
+            <label style={labelStyle}>Электронная почта</label>
+            <div style={{ position: 'relative' }}>
+              <Mail
+                size={18}
+                color="#85859D"
+                style={{
+                  position: 'absolute',
+                  left: 14,
+                  top: 14
+                }}
+              />
+              <input
+                type="email"
+                value={email}
+                onChange={(event) => setEmail(event.target.value)}
+                placeholder="name@example.com"
+                autoComplete="email"
+                maxLength={254}
+                required
+                style={fieldStyle}
+              />
+            </div>
+          </div>
+
+          <div style={{ marginBottom: 17 }}>
+            <label style={labelStyle}>Пароль</label>
+            <div style={{ position: 'relative' }}>
+              <LockKeyhole
+                size={18}
+                color="#85859D"
+                style={{
+                  position: 'absolute',
+                  left: 14,
+                  top: 14
+                }}
+              />
+              <input
+                type={showPassword ? 'text' : 'password'}
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                placeholder="Минимум 8 символов"
+                autoComplete={isRegister ? 'new-password' : 'current-password'}
+                minLength={8}
+                maxLength={128}
+                required
+                style={{ ...fieldStyle, paddingRight: 44 }}
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword((value) => !value)}
+                aria-label={showPassword ? 'Скрыть пароль' : 'Показать пароль'}
+                style={{
+                  position: 'absolute',
+                  right: 12,
+                  top: 11,
+                  width: 26,
+                  height: 26,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  background: 'transparent',
+                  border: 0,
+                  padding: 0,
+                  color: '#85859D',
+                  cursor: 'pointer'
+                }}
+              >
+                {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+              </button>
+            </div>
+          </div>
+
+          {isRegister && (
+            <div style={{ marginBottom: 18 }}>
+              <label style={labelStyle}>Повтори пароль</label>
+              <div style={{ position: 'relative' }}>
+                <Check
+                  size={18}
+                  color="#85859D"
+                  style={{
+                    position: 'absolute',
+                    left: 14,
+                    top: 14
+                  }}
+                />
+                <input
+                  type={showPassword ? 'text' : 'password'}
+                  value={confirmPassword}
+                  onChange={(event) => setConfirmPassword(event.target.value)}
+                  placeholder="Введи пароль ещё раз"
+                  autoComplete="new-password"
+                  maxLength={128}
+                  required
+                  style={fieldStyle}
+                />
+              </div>
+            </div>
+          )}
+
+          {error && (
+            <div
+              role="alert"
+              style={{
+                padding: '11px 12px',
+                marginBottom: 17,
+                borderRadius: 10,
+                background: '#5A263333',
+                border: '1px solid #A94F6755',
+                color: '#F0A6B5',
+                fontSize: 13,
+                lineHeight: 1.5,
+                overflowWrap: 'anywhere'
+              }}
+            >
+              {error}
+            </div>
+          )}
+
+          <button
+            type="submit"
+            disabled={busy}
+            style={{
+              width: '100%',
+              height: 48,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 9,
+              marginTop: 5,
+              border: 0,
+              borderRadius: 12,
+              background: busy
+                ? '#5C4DA8'
+                : 'linear-gradient(100deg, #8B78F6, #6D58DF)',
+              color: '#FFFFFF',
+              fontSize: 14,
+              fontWeight: 750,
+              cursor: busy ? 'wait' : 'pointer',
+              opacity: busy ? 0.8 : 1
+            }}
+          >
+            {busy
+              ? 'Подожди…'
+              : isRegister
+                ? 'Создать аккаунт'
+                : 'Войти в Echo'}
+          </button>
+        </form>
+
+        <p
+          style={{
+            textAlign: 'center',
+            margin: '22px 0 0',
+            color: '#77778D',
+            fontSize: 12,
+            lineHeight: 1.6
+          }}
+        >
+          {isRegister
+            ? 'После регистрации ты сразу попадёшь в Echo.'
+            : 'Твой аккаунт и профиль сохраняются в базе данных.'}
+        </p>
+      </div>
+    </div>
+  );
+}
+
 function App() {
+  const [authReady, setAuthReady] = useState(false);
+  const [authenticated, setAuthenticated] = useState(false);
+  const [authMode, setAuthMode] = useState<AuthMode>('login');
+  const [myEmail, setMyEmail] = useState('');
+  const [loggingOut, setLoggingOut] = useState(false);
+
   const [activeTab, setActiveTab] = useState('Звонки');
   const [search, setSearch] = useState('');
   const [myName, setMyName] = useState(
@@ -187,43 +718,21 @@ function App() {
     call.name.toLowerCase().includes(search.toLowerCase())
   );
 
-  const addHistory = useCallback(
-    (
-      contact: Contact,
-      type: 'incoming' | 'outgoing' | 'missed',
-      startedAt: number | null
-    ) => {
-      const duration =
-        startedAt === null
-          ? 'Не отвечен'
-          : (() => {
-              const seconds = Math.max(
-                0,
-                Math.floor((Date.now() - startedAt) / 1000)
-              );
+  const refreshHistory = useCallback(async () => {
+    if (!localStorage.getItem(TOKEN_KEY)) return;
 
-              return `${Math.floor(seconds / 60)
-                .toString()
-                .padStart(2, '0')}:${(seconds % 60)
-                .toString()
-                .padStart(2, '0')}`;
-            })();
+    try {
+      const result = await getJson<{ history: ServerHistoryItem[] }>(
+        '/api/history'
+      );
 
-      setCalls((previous) => [
-        {
-          id: Date.now(),
-          name: contact.name,
-          time: 'Только что',
-          duration,
-          type,
-          color: contact.color,
-          initials: contact.initials
-        },
-        ...previous
-      ]);
-    },
-    []
-  );
+      setCalls(
+        (result.history || []).map(mapServerHistory)
+      );
+    } catch (error) {
+      console.error('Не удалось обновить историю звонков:', error);
+    }
+  }, []);
 
   const resetCallUi = useCallback(() => {
     setSelectedContact(null);
@@ -355,40 +864,145 @@ function App() {
     []
   );
 
+  // Восстанавливаем аккаунт из сохранённой серверной сессии.
   useEffect(() => {
     let cancelled = false;
 
-    async function register() {
+    async function restoreSession() {
+      const token = localStorage.getItem(TOKEN_KEY);
+
+      if (!token) {
+        if (!cancelled) setAuthReady(true);
+        return;
+      }
+
       try {
-        const result = await postJson<{ user: Contact }>('/api/register', {
-          name: myName
+        const response = await fetch(`${API_URL}/api/auth/me`, {
+          headers: {
+            Authorization: `Bearer ${token}`
+          }
         });
 
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok || !data.user?.id) {
+          localStorage.removeItem(TOKEN_KEY);
+
+          if (!cancelled) {
+            setAuthenticated(false);
+            setAuthReady(true);
+          }
+
+          return;
+        }
+
         if (cancelled) return;
 
-        setUserId(result.user.id);
+        const user = data.user as AuthResponse['user'];
+
+        setUserId(user.id);
+        setMyName(user.name);
+        setMyEmail(user.email);
+        localStorage.setItem('echo-display-name', user.name);
+        setAuthenticated(true);
         setConnectionOnline(true);
-      } catch (error) {
-        if (cancelled) return;
-
-        setConnectionOnline(false);
-        setCallError(
-          error instanceof Error
-            ? error.message
-            : 'Не удалось зарегистрироваться на сервере.'
-        );
+      } catch {
+        if (!cancelled) {
+          setConnectionOnline(false);
+          setCallError(
+            'Не удалось связаться с сервером. Проверь подключение к интернету.'
+          );
+        }
+      } finally {
+        if (!cancelled) setAuthReady(true);
       }
     }
 
-    void register();
+    void restoreSession();
 
     return () => {
       cancelled = true;
     };
   }, []);
 
+  const handleAuthenticated = useCallback((result: AuthResponse) => {
+    localStorage.setItem(TOKEN_KEY, result.token);
+    localStorage.setItem('echo-display-name', result.user.name);
+
+    setUserId(result.user.id);
+    setMyName(result.user.name);
+    setMyEmail(result.user.email);
+    setAuthenticated(true);
+    setConnectionOnline(true);
+    setCallError('');
+    setAuthReady(true);
+  }, []);
+
+  // Загружаем сохранённую историю после входа и периодически обновляем её,
+  // чтобы видеть завершённые и пропущенные вызовы на других устройствах.
   useEffect(() => {
-    if (!userId) return;
+    if (!authenticated || !userId) {
+      setCalls([]);
+      return;
+    }
+
+    void refreshHistory();
+
+    const timer = window.setInterval(() => {
+      void refreshHistory();
+    }, 10000);
+
+    return () => window.clearInterval(timer);
+  }, [authenticated, userId, refreshHistory]);
+
+  async function logout() {
+    if (loggingOut) return;
+
+    setLoggingOut(true);
+
+    const token = localStorage.getItem(TOKEN_KEY);
+
+    try {
+      if (token) {
+        await fetch(`${API_URL}/api/auth/logout`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`
+          }
+        });
+      }
+    } catch {
+      // Локальный выход всё равно выполняется при отсутствии сети.
+    }
+
+    attemptRef.current += 1;
+
+    if (roomRef.current) {
+      await roomRef.current.disconnect().catch(() => undefined);
+      roomRef.current = null;
+    }
+
+    localStorage.removeItem(TOKEN_KEY);
+
+    setAuthenticated(false);
+    setUserId('');
+    setMyEmail('');
+    setContacts([]);
+    setCalls([]);
+    setIncomingCall(null);
+    setSelectedContact(null);
+    setCurrentCallId('');
+    currentCallIdRef.current = '';
+    joiningCallIdRef.current = '';
+    setCallStatus('idle');
+    setCallError('');
+    setConnectionOnline(false);
+    setLoggingOut(false);
+    setAuthMode('login');
+  }
+
+  useEffect(() => {
+    if (!authenticated || !userId) return;
 
     let cancelled = false;
     let polling = false;
@@ -398,8 +1012,15 @@ function App() {
       polling = true;
 
       try {
+        const token = localStorage.getItem(TOKEN_KEY);
+
         const response = await fetch(
-          `${API_URL}/api/state?userId=${encodeURIComponent(userId)}`
+          `${API_URL}/api/state?userId=${encodeURIComponent(userId)}`,
+          {
+            headers: token
+              ? { Authorization: `Bearer ${token}` }
+              : {}
+          }
         );
 
         if (!response.ok) {
@@ -451,6 +1072,7 @@ function App() {
               'Вызов завершён, отклонён или не получил ответа.'
             );
             setCallStatus('error');
+            void refreshHistory();
           }
         }
       } catch {
@@ -470,7 +1092,14 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [userId, myName, joinCall, callStatus]);
+  }, [
+    authenticated,
+    userId,
+    myName,
+    joinCall,
+    callStatus,
+    refreshHistory
+  ]);
 
   useEffect(() => {
     return () => {
@@ -493,8 +1122,8 @@ function App() {
 
     const name = proposedName.trim().replace(/\s+/g, ' ').slice(0, 48);
 
-    if (!name) {
-      setCallError('Имя не может быть пустым.');
+    if (name.length < 2) {
+      setCallError('Имя должно содержать минимум 2 символа.');
       return;
     }
 
@@ -573,6 +1202,7 @@ function App() {
     try {
       await postJson(`/api/call/${incomingCall.id}/reject`, { userId });
       setIncomingCall(null);
+      await refreshHistory();
     } catch (error) {
       setCallError(
         error instanceof Error ? error.message : 'Не удалось отклонить вызов.'
@@ -603,8 +1233,6 @@ function App() {
 
   async function endCall() {
     const id = currentCallIdRef.current;
-    const contact = selectedContact;
-    const startedAt = callStartedAtRef.current;
     const room = roomRef.current;
 
     attemptRef.current += 1;
@@ -614,30 +1242,59 @@ function App() {
       try {
         await room.disconnect();
       } catch {
+        // Продолжаем завершение вызова на сервере.
       }
     }
 
     if (id && userId) {
       try {
         await postJson(`/api/call/${id}/end`, { userId });
-      } catch {
+      } catch (error) {
+        console.error('Не удалось завершить звонок на сервере:', error);
       }
     }
 
-    if (contact) {
-      addHistory(
-        contact,
-        incomingCall ? 'incoming' : 'outgoing',
-        startedAt
-      );
-    }
-
     resetCallUi();
+    await refreshHistory();
   }
 
   function dismissCallError() {
     setCallError('');
     resetCallUi();
+  }
+
+  if (!authReady) {
+    return (
+      <div
+        style={{
+          minHeight: '100vh',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: 15,
+          background: '#101018',
+          color: '#FFFFFF',
+          fontFamily: 'inherit'
+        }}
+      >
+        <AudioLines size={40} color="#8B78F6" />
+        <strong style={{ fontSize: 25 }}>echo</strong>
+        <span style={{ color: '#9696AB', fontSize: 14 }}>
+          Проверяем сессию…
+        </span>
+      </div>
+    );
+  }
+
+  if (!authenticated) {
+    return (
+      <AuthScreen
+        mode={authMode}
+        setMode={setAuthMode}
+        onAuthenticated={handleAuthenticated}
+      />
+    );
   }
 
   const showCallWindow = Boolean(selectedContact);
@@ -657,7 +1314,7 @@ function App() {
           <div className="profile-avatar">{initialsOf(myName)}</div>
           <div className="profile-info">
             <strong>{myName}</strong>
-            <span>{userId ? 'Мой аккаунт' : 'Подключение…'}</span>
+            <span>Мой аккаунт</span>
           </div>
           <MoreHorizontal size={20} className="muted-icon" />
         </button>
@@ -710,6 +1367,16 @@ function App() {
             <span>Настройки</span>
           </button>
 
+          <button
+            className="nav-item"
+            onClick={() => void logout()}
+            disabled={loggingOut}
+            style={{ color: '#E5A5BC' }}
+          >
+            <LogOut size={19} />
+            <span>{loggingOut ? 'Выходим…' : 'Выйти из аккаунта'}</span>
+          </button>
+
           <div className="sidebar-footer">
             <span>Echo Desktop</span>
             <span>v1.1.0</span>
@@ -757,7 +1424,10 @@ function App() {
               </div>
 
               <div className="settings-card">
-                <button className="settings-row" onClick={() => void changeProfile()}>
+                <button
+                  className="settings-row"
+                  onClick={() => void changeProfile()}
+                >
                   <div className="settings-icon">
                     <Users size={21} />
                   </div>
@@ -767,6 +1437,22 @@ function App() {
                   </div>
                   <span className="settings-value">{myName}</span>
                 </button>
+
+                <div className="settings-row">
+                  <div className="settings-icon">
+                    <Mail size={21} />
+                  </div>
+                  <div>
+                    <strong>Электронная почта</strong>
+                    <p>Адрес твоего аккаунта</p>
+                  </div>
+                  <span
+                    className="settings-value"
+                    style={{ overflowWrap: 'anywhere' }}
+                  >
+                    {myEmail}
+                  </span>
+                </div>
 
                 <div className="settings-row">
                   <div className="settings-icon">
@@ -999,7 +1685,7 @@ function App() {
 
                     {filteredCalls.length === 0 && (
                       <div className="empty-state">
-                        Здесь пока нет звонков в этой сессии.
+                        Здесь пока нет сохранённых звонков.
                       </div>
                     )}
                   </div>

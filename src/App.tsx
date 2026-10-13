@@ -69,7 +69,7 @@ type CallStatus =
   | 'connected'
   | 'error';
 
-const API_URL = 'http://127.0.0.1:3001';
+const API_URL = 'https://echo-mufe.onrender.com';
 
 const avatarColors = [
   '#8B78F6',
@@ -355,7 +355,6 @@ function App() {
     []
   );
 
-  // Регистрируем каждое окно приложения как отдельного пользователя.
   useEffect(() => {
     let cancelled = false;
 
@@ -386,11 +385,8 @@ function App() {
     return () => {
       cancelled = true;
     };
-    // Имя при запуске используется для создания отдельной сессии.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Получаем список пользователей и отслеживаем состояние звонков.
   useEffect(() => {
     if (!userId) return;
 
@@ -476,7 +472,6 @@ function App() {
     };
   }, [userId, myName, joinCall, callStatus]);
 
-  // Отключаем комнату при закрытии окна.
   useEffect(() => {
     return () => {
       attemptRef.current += 1;
@@ -561,8 +556,6 @@ function App() {
       setIncomingCall(null);
       setCallStatus('connecting');
       endedCallIdsRef.current.delete(call.id);
-
-      // Подключение произойдёт после обновления состояния сервера.
     } catch (error) {
       setCallError(
         error instanceof Error ? error.message : 'Не удалось принять вызов.'
@@ -621,7 +614,6 @@ function App() {
       try {
         await room.disconnect();
       } catch {
-        // Интерфейс всё равно сбрасывается.
       }
     }
 
@@ -629,7 +621,6 @@ function App() {
       try {
         await postJson(`/api/call/${id}/end`, { userId });
       } catch {
-        // Вызов мог уже завершиться на сервере.
       }
     }
 

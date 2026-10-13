@@ -1,4 +1,3 @@
-
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -8,7 +7,7 @@ import { AccessToken } from 'livekit-server-sdk';
 dotenv.config();
 
 const app = express();
-const PORT = 3001;
+const PORT = Number(process.env.PORT) || 3001;
 
 const LIVEKIT_URL = process.env.LIVEKIT_URL;
 const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY;
@@ -16,7 +15,7 @@ const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET;
 
 if (!LIVEKIT_URL || !LIVEKIT_API_KEY || !LIVEKIT_API_SECRET) {
   console.error(
-    'Не заданы LIVEKIT_URL, LIVEKIT_API_KEY или LIVEKIT_API_SECRET в .env'
+    'Не заданы LIVEKIT_URL, LIVEKIT_API_KEY или LIVEKIT_API_SECRET в переменных окружения.'
   );
   process.exit(1);
 }
@@ -106,7 +105,9 @@ function findCall(id) {
 }
 
 function isCallParticipant(call, userId) {
-  return call && (call.from === userId || call.to === userId);
+  return Boolean(
+    call && (call.from === userId || call.to === userId)
+  );
 }
 
 function touchUser(userId) {
@@ -155,7 +156,6 @@ app.get('/health', (_req, res) => {
   });
 });
 
-// Регистрация отдельного запущенного экземпляра приложения.
 app.post('/api/register', (req, res) => {
   const name = cleanName(req.body?.name);
 
@@ -180,11 +180,12 @@ app.post('/api/register', (req, res) => {
   });
 });
 
-// Изменение имени текущего пользователя.
 app.post('/api/profile', (req, res) => {
   const { userId } = req.body ?? {};
   const name = cleanName(req.body?.name);
-  const user = typeof userId === 'string' ? touchUser(userId) : null;
+  const user = typeof userId === 'string'
+    ? touchUser(userId)
+    : null;
 
   if (!user) {
     return res.status(404).json({
@@ -205,7 +206,6 @@ app.post('/api/profile', (req, res) => {
   });
 });
 
-// Список онлайн-пользователей и состояние звонков.
 app.get('/api/state', (req, res) => {
   cleanup();
 
@@ -257,14 +257,15 @@ app.get('/api/state', (req, res) => {
   });
 });
 
-// Инициировать звонок.
 app.post('/api/call', (req, res) => {
   cleanup();
 
   const { callerId, calleeId } = req.body ?? {};
+
   const caller = typeof callerId === 'string'
     ? touchUser(callerId)
     : null;
+
   const callee = typeof calleeId === 'string'
     ? users.get(calleeId)
     : null;
@@ -290,10 +291,12 @@ app.post('/api/call', (req, res) => {
   const busy = [...calls.values()].some(
     (call) =>
       ['ringing', 'accepted'].includes(call.status) &&
-      (call.from === callee.id ||
+      (
+        call.from === callee.id ||
         call.to === callee.id ||
         call.from === caller.id ||
-        call.to === caller.id)
+        call.to === caller.id
+      )
   );
 
   if (busy) {
@@ -320,11 +323,13 @@ app.post('/api/call', (req, res) => {
   });
 });
 
-// Принять входящий вызов.
 app.post('/api/call/:id/accept', (req, res) => {
   const { userId } = req.body ?? {};
   const call = findCall(req.params.id);
-  const user = typeof userId === 'string' ? touchUser(userId) : null;
+
+  const user = typeof userId === 'string'
+    ? touchUser(userId)
+    : null;
 
   if (!user || !call || call.to !== user.id) {
     return res.status(404).json({
@@ -345,7 +350,6 @@ app.post('/api/call/:id/accept', (req, res) => {
   });
 });
 
-// Отклонить вызов.
 app.post('/api/call/:id/reject', (req, res) => {
   const { userId } = req.body ?? {};
   const call = findCall(req.params.id);
@@ -363,7 +367,6 @@ app.post('/api/call/:id/reject', (req, res) => {
   res.json({ ok: true });
 });
 
-// Завершить вызов или отменить исходящий.
 app.post('/api/call/:id/end', (req, res) => {
   const { userId } = req.body ?? {};
   const call = findCall(req.params.id);
@@ -381,12 +384,17 @@ app.post('/api/call/:id/end', (req, res) => {
   res.json({ ok: true });
 });
 
-// Токен выдаётся только участнику зарегистрированного звонка.
 app.post('/api/token', async (req, res) => {
   try {
     const { callId, userId, participantName } = req.body ?? {};
-    const call = typeof callId === 'string' ? findCall(callId) : null;
-    const user = typeof userId === 'string' ? touchUser(userId) : null;
+
+    const call = typeof callId === 'string'
+      ? findCall(callId)
+      : null;
+
+    const user = typeof userId === 'string'
+      ? touchUser(userId)
+      : null;
 
     if (
       !call ||
@@ -436,6 +444,6 @@ app.post('/api/token', async (req, res) => {
   }
 });
 
-app.listen(PORT, '127.0.0.1', () => {
-  console.log(`Echo voice server запущен: http://127.0.0.1:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Echo voice server запущен на порту ${PORT}`);
 });

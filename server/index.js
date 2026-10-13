@@ -20,7 +20,6 @@ const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY;
 const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET;
 const DATABASE_URL = process.env.DATABASE_URL;
 
-// SMTP (Resend, Brevo, Gmail и т.д.)
 const SMTP_HOST = process.env.SMTP_HOST || '';
 const SMTP_PORT = Number(process.env.SMTP_PORT) || 587;
 const SMTP_USER = process.env.SMTP_USER || '';
@@ -30,7 +29,7 @@ const SMTP_FROM = process.env.SMTP_FROM || 'Echo <noreply@echo.app>';
 const SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
 const USER_TIMEOUT = 20000;
 const CALL_TIMEOUT = 60000;
-const CODE_TTL_MS = 15 * 60 * 1000; // 15 минут
+const CODE_TTL_MS = 15 * 60 * 1000;
 const MAX_CODE_ATTEMPTS = 8;
 
 if (!LIVEKIT_URL || !LIVEKIT_API_KEY || !LIVEKIT_API_SECRET) {
@@ -55,12 +54,10 @@ const calls = new Map();
 const localAccounts = new Map();
 const localSessions = new Map();
 const localHistory = new Map();
-const localPendingCodes = new Map(); // email -> { code, expires, attempts }
 
 app.use(
   cors({
-    origin(origin, callback) {
-      // Разрешаем localhost, null (Electron) и любой origin в проде
+    origin(_origin, callback) {
       callback(null, true);
     }
   })
@@ -84,7 +81,10 @@ function createMailTransport() {
     auth: {
       user: SMTP_USER,
       pass: SMTP_PASS
-    }
+    },
+    connectionTimeout: 8000,
+    greetingTimeout: 8000,
+    socketTimeout: 8000
   });
 }
 
@@ -94,17 +94,30 @@ async function sendVerificationEmail(email, code) {
   const subject = 'Код подтверждения Echo';
   const text = `Твой код подтверждения для Echo: ${code}\n\nКод действует 15 минут.\nЕсли ты не регистрировался в Echo — просто проигнорируй это письмо.`;
 
+  // Всегда пишем код в логи
+  console.log(`[EMAIL] Код для ${email}: ${code}`);
+
   if (!mailTransport) {
-    console.log(`[EMAIL DEV] Код для ${email}: ${code}`);
+    console.log('[EMAIL] SMTP не настроен, письмо не отправлено');
     return;
   }
 
-  await mailTransport.sendMail({
-    from: SMTP_FROM,
-    to: email,
-    subject,
-    text
-  });
+  try {
+    await Promise.race([
+      mailTransport.sendMail({
+        from: SMTP_FROM,
+        to: email,
+        subject,
+        text
+      }),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('SMTP timeout 8s')), 8000)
+      )
+    ]);
+    console.log(`[EMAIL] Письмо успешно отправлено на ${email}`);
+  } catch (err) {
+    console.error('[EMAIL] Ошибка отправки:', err.message || err);
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -247,7 +260,6 @@ function cleanEmail(value) {
 
 function cleanUsername(value) {
   if (typeof value !== 'string') return '';
-  // убираем @ в начале, оставляем только латиницу, цифры, _ и .
   let u = value.trim().toLowerCase().replace(/^@+/, '');
   u = u.replace(/[^a-z0-9._]/g, '');
   return u.slice(0, 32);
@@ -260,7 +272,6 @@ function isValidEmail(email) {
 }
 
 function isValidUsername(username) {
-  // 3–32 символа, начинается с буквы или цифры
   return (
     username.length >= 3 &&
     username.length <= 32 &&
@@ -762,7 +773,7 @@ app.get('/health', (_req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// Регистрация (создаёт аккаунт + отправляет код)
+// Регистрация
 // -----------------------------------------------------------------------------
 
 app.post('/api/auth/register', async (req, res) => {
@@ -807,7 +818,6 @@ app.post('/api/auth/register', async (req, res) => {
     const expires = new Date(Date.now() + CODE_TTL_MS);
 
     if (pool) {
-      // Проверяем уникальность заранее, чтобы дать понятную ошибку
       const existing = await pool.query(
         `SELECT
            (SELECT 1 FROM users WHERE LOWER(email) = $1 LIMIT 1) AS email_taken,
@@ -868,12 +878,8 @@ app.post('/api/auth/register', async (req, res) => {
       });
     }
 
-    try {
-      await sendVerificationEmail(email, code);
-    } catch (mailError) {
-      console.error('Не удалось отправить письмо:', mailError);
-      // Не откатываем регистрацию — код можно запросить повторно
-    }
+    // Письмо в фоне — ответ не ждёт SMTP
+    void sendVerificationEmail(email, code);
 
     res.status(201).json({
       needsVerification: true,
@@ -933,7 +939,6 @@ app.post('/api/auth/verify', async (req, res) => {
     }
 
     if (account.email_verified) {
-      // Уже подтверждён — просто логиним
       const token = await createSession(account.id);
 
       users.set(account.id, {
@@ -986,7 +991,6 @@ app.post('/api/auth/verify', async (req, res) => {
       });
     }
 
-    // Успех
     if (pool) {
       await pool.query(
         `UPDATE users
@@ -1087,14 +1091,7 @@ app.post('/api/auth/resend-code', async (req, res) => {
       account.verification_attempts = 0;
     }
 
-    try {
-      await sendVerificationEmail(email, code);
-    } catch (mailError) {
-      console.error('Не удалось отправить письмо:', mailError);
-      return res.status(500).json({
-        error: 'Не удалось отправить письмо. Попробуй позже.'
-      });
-    }
+    void sendVerificationEmail(email, code);
 
     res.json({ ok: true, email });
   } catch (error) {
@@ -1302,7 +1299,7 @@ app.use(
 );
 
 // -----------------------------------------------------------------------------
-// Поиск пользователей по @username
+// Поиск пользователей
 // -----------------------------------------------------------------------------
 
 app.get('/api/users/search', async (req, res) => {
@@ -1375,7 +1372,7 @@ app.get('/api/users/search', async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// История звонков
+// История
 // -----------------------------------------------------------------------------
 
 app.get('/api/history', async (req, res) => {
@@ -1392,7 +1389,7 @@ app.get('/api/history', async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// Изменение профиля (имя + ник)
+// Профиль
 // -----------------------------------------------------------------------------
 
 app.post('/api/profile', async (req, res) => {
@@ -1549,7 +1546,7 @@ app.get('/api/state', async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// Создание звонка
+// Звонки
 // -----------------------------------------------------------------------------
 
 app.post('/api/call', async (req, res) => {
@@ -1563,7 +1560,6 @@ app.post('/api/call', async (req, res) => {
     const caller = await restoreUser(req.authUser.id);
     let callee = touchUser(calleeId);
 
-    // Если пользователь не в online-кэше — пробуем подтянуть из БД
     if (!callee && pool) {
       const result = await pool.query(
         `SELECT id, name, username
@@ -1651,10 +1647,6 @@ app.post('/api/call', async (req, res) => {
     });
   }
 });
-
-// -----------------------------------------------------------------------------
-// Принятие / отклонение / завершение звонка + токен — без изменений логики
-// -----------------------------------------------------------------------------
 
 app.post('/api/call/:id/accept', async (req, res) => {
   try {
@@ -1833,6 +1825,8 @@ async function startServer() {
         console.warn(
           'SMTP не настроен. Коды подтверждения будут в логах сервера.'
         );
+      } else {
+        console.log('SMTP настроен, письма будут отправляться.');
       }
     });
   } catch (error) {

@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { promisify } from 'node:util';
 import pg from 'pg';
 import { AccessToken } from 'livekit-server-sdk';
-import nodemailer from 'nodemailer';
+import { Resend } from 'resend';
 
 dotenv.config();
 
@@ -20,11 +20,8 @@ const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY;
 const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET;
 const DATABASE_URL = process.env.DATABASE_URL;
 
-const SMTP_HOST = process.env.SMTP_HOST || '';
-const SMTP_PORT = Number(process.env.SMTP_PORT) || 587;
-const SMTP_USER = process.env.SMTP_USER || '';
-const SMTP_PASS = process.env.SMTP_PASS || '';
-const SMTP_FROM = process.env.SMTP_FROM || 'Echo <noreply@echo.app>';
+const SMTP_PASS = process.env.SMTP_PASS || process.env.RESEND_API_KEY || '';
+const SMTP_FROM = process.env.SMTP_FROM || 'Echo <onboarding@resend.dev>';
 
 const SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
 const USER_TIMEOUT = 20000;
@@ -66,55 +63,37 @@ app.use(
 app.use(express.json({ limit: '10kb' }));
 
 // -----------------------------------------------------------------------------
-// Почта
+// Почта через Resend API
 // -----------------------------------------------------------------------------
 
-function createMailTransport() {
-  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) {
-    return null;
-  }
-
-  return nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: SMTP_PORT,
-    secure: SMTP_PORT === 465,
-    auth: {
-      user: SMTP_USER,
-      pass: SMTP_PASS
-    },
-    connectionTimeout: 8000,
-    greetingTimeout: 8000,
-    socketTimeout: 8000
-  });
-}
-
-const mailTransport = createMailTransport();
+const resend = SMTP_PASS ? new Resend(SMTP_PASS) : null;
 
 async function sendVerificationEmail(email, code) {
   const subject = 'Код подтверждения Echo';
   const text = `Твой код подтверждения для Echo: ${code}\n\nКод действует 15 минут.\nЕсли ты не регистрировался в Echo — просто проигнорируй это письмо.`;
 
-  // Всегда пишем код в логи
   console.log(`[EMAIL] Код для ${email}: ${code}`);
 
-  if (!mailTransport) {
-    console.log('[EMAIL] SMTP не настроен, письмо не отправлено');
+  if (!resend) {
+    console.log('[EMAIL] Resend API key не задан, письмо не отправлено');
     return;
   }
 
   try {
-    await Promise.race([
-      mailTransport.sendMail({
-        from: SMTP_FROM,
-        to: email,
-        subject,
-        text
-      }),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('SMTP timeout 8s')), 8000)
-      )
-    ]);
-    console.log(`[EMAIL] Письмо успешно отправлено на ${email}`);
+    const result = await resend.emails.send({
+      from: SMTP_FROM,
+      to: email,
+      subject,
+      text
+    });
+
+    if (result.error) {
+      console.error('[EMAIL] Ошибка Resend:', JSON.stringify(result.error));
+    } else {
+      console.log(
+        `[EMAIL] Письмо успешно отправлено на ${email}, id: ${result.data?.id}`
+      );
+    }
   } catch (err) {
     console.error('[EMAIL] Ошибка отправки:', err.message || err);
   }
@@ -878,7 +857,6 @@ app.post('/api/auth/register', async (req, res) => {
       });
     }
 
-    // Письмо в фоне — ответ не ждёт SMTP
     void sendVerificationEmail(email, code);
 
     res.status(201).json({
@@ -1821,17 +1799,17 @@ async function startServer() {
 
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`Echo voice server запущен на порту ${PORT}`);
-      if (!mailTransport) {
+      if (!resend) {
         console.warn(
-          'SMTP не настроен. Коды подтверждения будут в логах сервера.'
+          'Resend API key не задан. Коды будут только в логах.'
         );
       } else {
-        console.log('SMTP настроен, письма будут отправляться.');
+        console.log('Resend API настроен, письма будут отправляться.');
       }
     });
   } catch (error) {
     console.error(
-      'Не удалось запустить Echo или подключить PostgreSQL:',
+      'Не удалось запустить Echo',
       error
     );
 

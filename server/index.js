@@ -1,4 +1,3 @@
-
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -6,6 +5,7 @@ import crypto from 'node:crypto';
 import { promisify } from 'node:util';
 import pg from 'pg';
 import { AccessToken } from 'livekit-server-sdk';
+import nodemailer from 'nodemailer';
 
 dotenv.config();
 
@@ -20,9 +20,18 @@ const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY;
 const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET;
 const DATABASE_URL = process.env.DATABASE_URL;
 
+// SMTP (Resend, Brevo, Gmail и т.д.)
+const SMTP_HOST = process.env.SMTP_HOST || '';
+const SMTP_PORT = Number(process.env.SMTP_PORT) || 587;
+const SMTP_USER = process.env.SMTP_USER || '';
+const SMTP_PASS = process.env.SMTP_PASS || '';
+const SMTP_FROM = process.env.SMTP_FROM || 'Echo <noreply@echo.app>';
+
 const SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
 const USER_TIMEOUT = 20000;
 const CALL_TIMEOUT = 60000;
+const CODE_TTL_MS = 15 * 60 * 1000; // 15 минут
+const MAX_CODE_ATTEMPTS = 8;
 
 if (!LIVEKIT_URL || !LIVEKIT_API_KEY || !LIVEKIT_API_SECRET) {
   console.error(
@@ -46,26 +55,57 @@ const calls = new Map();
 const localAccounts = new Map();
 const localSessions = new Map();
 const localHistory = new Map();
+const localPendingCodes = new Map(); // email -> { code, expires, attempts }
 
 app.use(
   cors({
     origin(origin, callback) {
-      const allowedOrigins = [
-        'http://localhost:5173',
-        'http://127.0.0.1:5173',
-        'null'
-      ];
-
-      if (!origin || allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error('Origin не разрешён'));
-      }
+      // Разрешаем localhost, null (Electron) и любой origin в проде
+      callback(null, true);
     }
   })
 );
 
 app.use(express.json({ limit: '10kb' }));
+
+// -----------------------------------------------------------------------------
+// Почта
+// -----------------------------------------------------------------------------
+
+function createMailTransport() {
+  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) {
+    return null;
+  }
+
+  return nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_PORT === 465,
+    auth: {
+      user: SMTP_USER,
+      pass: SMTP_PASS
+    }
+  });
+}
+
+const mailTransport = createMailTransport();
+
+async function sendVerificationEmail(email, code) {
+  const subject = 'Код подтверждения Echo';
+  const text = `Твой код подтверждения для Echo: ${code}\n\nКод действует 15 минут.\nЕсли ты не регистрировался в Echo — просто проигнорируй это письмо.`;
+
+  if (!mailTransport) {
+    console.log(`[EMAIL DEV] Код для ${email}: ${code}`);
+    return;
+  }
+
+  await mailTransport.sendMail({
+    from: SMTP_FROM,
+    to: email,
+    subject,
+    text
+  });
+}
 
 // -----------------------------------------------------------------------------
 // База данных
@@ -98,9 +138,40 @@ async function initDatabase() {
   `);
 
   await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS username VARCHAR(32)
+  `);
+
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE
+  `);
+
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS verification_code VARCHAR(6)
+  `);
+
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS verification_expires TIMESTAMPTZ
+  `);
+
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS verification_attempts INTEGER NOT NULL DEFAULT 0
+  `);
+
+  await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique
     ON users (LOWER(email))
     WHERE email IS NOT NULL
+  `);
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS users_username_unique
+    ON users (LOWER(username))
+    WHERE username IS NOT NULL
   `);
 
   await pool.query(`
@@ -131,7 +202,6 @@ async function initDatabase() {
     )
   `);
 
-  // Обновляем существующую таблицу без удаления старых записей.
   await pool.query(`
     ALTER TABLE call_history
     ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ
@@ -175,16 +245,35 @@ function cleanEmail(value) {
   return value.trim().toLowerCase();
 }
 
+function cleanUsername(value) {
+  if (typeof value !== 'string') return '';
+  // убираем @ в начале, оставляем только латиницу, цифры, _ и .
+  let u = value.trim().toLowerCase().replace(/^@+/, '');
+  u = u.replace(/[^a-z0-9._]/g, '');
+  return u.slice(0, 32);
+}
+
 function isValidEmail(email) {
-  return email.length <= 254 &&
-    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+  return (
+    email.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+  );
+}
+
+function isValidUsername(username) {
+  // 3–32 символа, начинается с буквы или цифры
+  return (
+    username.length >= 3 &&
+    username.length <= 32 &&
+    /^[a-z0-9][a-z0-9._]*$/.test(username)
+  );
 }
 
 function publicUser(user) {
   return {
     id: user.id,
     name: user.name,
-    online: Date.now() - user.lastSeen < USER_TIMEOUT
+    username: user.username || null,
+    online: Date.now() - (user.lastSeen || 0) < USER_TIMEOUT
   };
 }
 
@@ -192,7 +281,9 @@ function authUser(user) {
   return {
     id: user.id,
     name: user.name,
-    email: user.email
+    email: user.email,
+    username: user.username || null,
+    emailVerified: Boolean(user.email_verified ?? user.emailVerified)
   };
 }
 
@@ -222,12 +313,18 @@ async function verifyPassword(password, storedHash) {
   const derivedKey = await scryptAsync(password, salt, 64);
   const savedKey = Buffer.from(savedHex, 'hex');
 
-  return savedKey.length === derivedKey.length &&
-    crypto.timingSafeEqual(savedKey, derivedKey);
+  return (
+    savedKey.length === derivedKey.length &&
+    crypto.timingSafeEqual(savedKey, derivedKey)
+  );
 }
 
 function hashSessionToken(token) {
   return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+function generateCode() {
+  return String(Math.floor(100000 + Math.random() * 900000));
 }
 
 async function createSession(userId) {
@@ -266,12 +363,13 @@ async function findUserBySession(token) {
 
   if (pool) {
     const result = await pool.query(
-      `SELECT u.id, u.name, u.email
+      `SELECT u.id, u.name, u.email, u.username, u.email_verified
        FROM sessions s
        JOIN users u ON u.id = s.user_id
        WHERE s.token_hash = $1
          AND s.expires_at > NOW()
-         AND u.password_hash IS NOT NULL`,
+         AND u.password_hash IS NOT NULL
+         AND u.email_verified = TRUE`,
       [tokenHash]
     );
 
@@ -286,7 +384,8 @@ async function findUserBySession(token) {
   }
 
   const account = localAccounts.get(session.userId);
-  return account?.password_hash ? account : null;
+  if (!account?.password_hash || !account.email_verified) return null;
+  return account;
 }
 
 async function deleteSession(token) {
@@ -295,10 +394,9 @@ async function deleteSession(token) {
   const tokenHash = hashSessionToken(token);
 
   if (pool) {
-    await pool.query(
-      'DELETE FROM sessions WHERE token_hash = $1',
-      [tokenHash]
-    );
+    await pool.query('DELETE FROM sessions WHERE token_hash = $1', [
+      tokenHash
+    ]);
   } else {
     localSessions.delete(tokenHash);
   }
@@ -317,20 +415,13 @@ function getDurationSeconds(call) {
 
   const endTime = call.endedAt || Date.now();
 
-  return Math.max(
-    0,
-    Math.floor((endTime - call.acceptedAt) / 1000)
-  );
+  return Math.max(0, Math.floor((endTime - call.acceptedAt) / 1000));
 }
 
 async function saveCallHistory(call) {
-  // Не записываем звонок в историю, пока он не завершён,
-  // не отклонён и не стал пропущенным.
   if (!isFinalCallStatus(call.status)) return;
 
-  const endedAt = call.endedAt
-    ? new Date(call.endedAt)
-    : new Date();
+  const endedAt = call.endedAt ? new Date(call.endedAt) : new Date();
 
   const durationSeconds = getDurationSeconds({
     ...call,
@@ -345,8 +436,8 @@ async function saveCallHistory(call) {
       caller_id: call.from,
       callee_id: call.to,
       status: call.status,
-      created_at: previous?.created_at ||
-        new Date(call.createdAt).toISOString(),
+      created_at:
+        previous?.created_at || new Date(call.createdAt).toISOString(),
       updated_at: new Date().toISOString(),
       ended_at: previous?.ended_at || endedAt.toISOString(),
       accepted_at: call.acceptedAt
@@ -483,7 +574,7 @@ async function getCallHistory(userId) {
 }
 
 // -----------------------------------------------------------------------------
-// Авторизация защищённых API-маршрутов
+// Авторизация
 // -----------------------------------------------------------------------------
 
 async function requireAuth(req, res, next) {
@@ -493,7 +584,8 @@ async function requireAuth(req, res, next) {
 
     if (!account) {
       return res.status(401).json({
-        error: 'Сессия истекла или недействительна. Войди в аккаунт ещё раз.'
+        error:
+          'Сессия истекла или недействительна. Войди в аккаунт ещё раз.'
       });
     }
 
@@ -524,7 +616,7 @@ function requireOwnUserId(req, res, suppliedUserId) {
 }
 
 // -----------------------------------------------------------------------------
-// Восстановление пользователя и звонки
+// Восстановление пользователя
 // -----------------------------------------------------------------------------
 
 async function restoreUser(userId) {
@@ -539,11 +631,12 @@ async function restoreUser(userId) {
 
   if (!pool) {
     const account = localAccounts.get(userId);
-    if (!account) return null;
+    if (!account || !account.email_verified) return null;
 
     const user = {
       id: account.id,
       name: account.name,
+      username: account.username,
       lastSeen: Date.now()
     };
 
@@ -552,7 +645,9 @@ async function restoreUser(userId) {
   }
 
   const result = await pool.query(
-    'SELECT id, name FROM users WHERE id = $1',
+    `SELECT id, name, username
+     FROM users
+     WHERE id = $1 AND email_verified = TRUE`,
     [userId]
   );
 
@@ -561,6 +656,7 @@ async function restoreUser(userId) {
   const user = {
     id: result.rows[0].id,
     name: result.rows[0].name,
+    username: result.rows[0].username,
     lastSeen: Date.now()
   };
 
@@ -580,16 +676,20 @@ function getCallForUser(call, userId) {
     status: call.status,
     from: call.from,
     to: call.to,
-    caller: publicUser(users.get(call.from) || {
-      id: call.from,
-      name: 'Пользователь',
-      lastSeen: 0
-    }),
-    callee: publicUser(users.get(call.to) || {
-      id: call.to,
-      name: 'Пользователь',
-      lastSeen: 0
-    }),
+    caller: publicUser(
+      users.get(call.from) || {
+        id: call.from,
+        name: 'Пользователь',
+        lastSeen: 0
+      }
+    ),
+    callee: publicUser(
+      users.get(call.to) || {
+        id: call.to,
+        name: 'Пользователь',
+        lastSeen: 0
+      }
+    ),
     other: other
       ? publicUser(other)
       : {
@@ -651,7 +751,7 @@ function cleanup() {
 setInterval(cleanup, 5000);
 
 // -----------------------------------------------------------------------------
-// Проверка работоспособности
+// Health
 // -----------------------------------------------------------------------------
 
 app.get('/health', (_req, res) => {
@@ -662,18 +762,26 @@ app.get('/health', (_req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// Регистрация
+// Регистрация (создаёт аккаунт + отправляет код)
 // -----------------------------------------------------------------------------
 
 app.post('/api/auth/register', async (req, res) => {
   try {
     const name = cleanName(req.body?.name);
+    const username = cleanUsername(req.body?.username);
     const email = cleanEmail(req.body?.email);
     const password = req.body?.password;
 
     if (name.length < 2) {
       return res.status(400).json({
         error: 'Имя должно содержать минимум 2 символа.'
+      });
+    }
+
+    if (!isValidUsername(username)) {
+      return res.status(400).json({
+        error:
+          'Ник должен быть от 3 до 32 символов (латиница, цифры, точка и _). Без @.'
       });
     }
 
@@ -695,28 +803,44 @@ app.post('/api/auth/register', async (req, res) => {
 
     const passwordHash = await createPasswordHash(password);
     const id = crypto.randomUUID();
-
-    let account;
+    const code = generateCode();
+    const expires = new Date(Date.now() + CODE_TTL_MS);
 
     if (pool) {
-      const result = await pool.query(
-        `INSERT INTO users (id, name, email, password_hash)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT DO NOTHING
-         RETURNING id, name, email`,
-        [id, name, email, passwordHash]
+      // Проверяем уникальность заранее, чтобы дать понятную ошибку
+      const existing = await pool.query(
+        `SELECT
+           (SELECT 1 FROM users WHERE LOWER(email) = $1 LIMIT 1) AS email_taken,
+           (SELECT 1 FROM users WHERE LOWER(username) = $2 LIMIT 1) AS username_taken`,
+        [email, username]
       );
 
-      if (result.rowCount === 0) {
+      if (existing.rows[0]?.email_taken) {
         return res.status(409).json({
           error: 'Этот адрес электронной почты уже зарегистрирован.'
         });
       }
 
-      account = result.rows[0];
+      if (existing.rows[0]?.username_taken) {
+        return res.status(409).json({
+          error: 'Этот ник уже занят. Выбери другой.'
+        });
+      }
+
+      await pool.query(
+        `INSERT INTO users (
+           id, name, email, password_hash, username,
+           email_verified, verification_code, verification_expires, verification_attempts
+         )
+         VALUES ($1, $2, $3, $4, $5, FALSE, $6, $7, 0)`,
+        [id, name, email, passwordHash, username, code, expires]
+      );
     } else {
       const emailTaken = [...localAccounts.values()].some(
-        (user) => user.email === email
+        (u) => u.email === email
+      );
+      const usernameTaken = [...localAccounts.values()].some(
+        (u) => u.username === username
       );
 
       if (emailTaken) {
@@ -725,14 +849,159 @@ app.post('/api/auth/register', async (req, res) => {
         });
       }
 
-      account = {
+      if (usernameTaken) {
+        return res.status(409).json({
+          error: 'Этот ник уже занят. Выбери другой.'
+        });
+      }
+
+      localAccounts.set(id, {
         id,
         name,
         email,
-        password_hash: passwordHash
-      };
+        username,
+        password_hash: passwordHash,
+        email_verified: false,
+        verification_code: code,
+        verification_expires: expires.getTime(),
+        verification_attempts: 0
+      });
+    }
 
-      localAccounts.set(id, account);
+    try {
+      await sendVerificationEmail(email, code);
+    } catch (mailError) {
+      console.error('Не удалось отправить письмо:', mailError);
+      // Не откатываем регистрацию — код можно запросить повторно
+    }
+
+    res.status(201).json({
+      needsVerification: true,
+      email
+    });
+  } catch (error) {
+    console.error('Ошибка регистрации:', error);
+
+    res.status(500).json({
+      error: 'Не удалось создать аккаунт. Попробуй ещё раз.'
+    });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Подтверждение кода
+// -----------------------------------------------------------------------------
+
+app.post('/api/auth/verify', async (req, res) => {
+  try {
+    const email = cleanEmail(req.body?.email);
+    const code =
+      typeof req.body?.code === 'string'
+        ? req.body.code.trim()
+        : '';
+
+    if (!isValidEmail(email) || !/^\d{6}$/.test(code)) {
+      return res.status(400).json({
+        error: 'Укажи почту и 6-значный код из письма.'
+      });
+    }
+
+    let account;
+
+    if (pool) {
+      const result = await pool.query(
+        `SELECT id, name, email, username, password_hash,
+                email_verified, verification_code, verification_expires,
+                verification_attempts
+         FROM users
+         WHERE LOWER(email) = $1
+         LIMIT 1`,
+        [email]
+      );
+
+      account = result.rows[0] || null;
+    } else {
+      account =
+        [...localAccounts.values()].find((u) => u.email === email) ||
+        null;
+    }
+
+    if (!account || !account.password_hash) {
+      return res.status(404).json({
+        error: 'Аккаунт не найден. Зарегистрируйся заново.'
+      });
+    }
+
+    if (account.email_verified) {
+      // Уже подтверждён — просто логиним
+      const token = await createSession(account.id);
+
+      users.set(account.id, {
+        id: account.id,
+        name: account.name,
+        username: account.username,
+        lastSeen: Date.now()
+      });
+
+      return res.json({
+        user: authUser({ ...account, email_verified: true }),
+        token
+      });
+    }
+
+    const expires = pool
+      ? account.verification_expires
+        ? new Date(account.verification_expires).getTime()
+        : 0
+      : account.verification_expires || 0;
+
+    if (!account.verification_code || Date.now() > expires) {
+      return res.status(400).json({
+        error: 'Код истёк. Запроси новый код.'
+      });
+    }
+
+    const attempts = Number(account.verification_attempts) || 0;
+
+    if (attempts >= MAX_CODE_ATTEMPTS) {
+      return res.status(429).json({
+        error: 'Слишком много попыток. Запроси новый код.'
+      });
+    }
+
+    if (account.verification_code !== code) {
+      if (pool) {
+        await pool.query(
+          `UPDATE users
+           SET verification_attempts = verification_attempts + 1
+           WHERE id = $1`,
+          [account.id]
+        );
+      } else {
+        account.verification_attempts = attempts + 1;
+      }
+
+      return res.status(400).json({
+        error: 'Неверный код. Проверь письмо и попробуй ещё раз.'
+      });
+    }
+
+    // Успех
+    if (pool) {
+      await pool.query(
+        `UPDATE users
+         SET email_verified = TRUE,
+             verification_code = NULL,
+             verification_expires = NULL,
+             verification_attempts = 0
+         WHERE id = $1`,
+        [account.id]
+      );
+    } else {
+      account.email_verified = true;
+      account.verification_code = null;
+      account.verification_expires = null;
+      account.verification_attempts = 0;
     }
 
     const token = await createSession(account.id);
@@ -740,18 +1009,99 @@ app.post('/api/auth/register', async (req, res) => {
     users.set(account.id, {
       id: account.id,
       name: account.name,
+      username: account.username,
       lastSeen: Date.now()
     });
 
-    res.status(201).json({
-      user: authUser(account),
+    res.json({
+      user: authUser({ ...account, email_verified: true }),
       token
     });
   } catch (error) {
-    console.error('Ошибка регистрации:', error);
+    console.error('Ошибка подтверждения кода:', error);
 
     res.status(500).json({
-      error: 'Не удалось создать аккаунт. Попробуй ещё раз.'
+      error: 'Не удалось подтвердить код. Попробуй ещё раз.'
+    });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Повторная отправка кода
+// -----------------------------------------------------------------------------
+
+app.post('/api/auth/resend-code', async (req, res) => {
+  try {
+    const email = cleanEmail(req.body?.email);
+
+    if (!isValidEmail(email)) {
+      return res.status(400).json({
+        error: 'Укажи корректный адрес электронной почты.'
+      });
+    }
+
+    let account;
+
+    if (pool) {
+      const result = await pool.query(
+        `SELECT id, email, email_verified
+         FROM users
+         WHERE LOWER(email) = $1
+         LIMIT 1`,
+        [email]
+      );
+      account = result.rows[0] || null;
+    } else {
+      account =
+        [...localAccounts.values()].find((u) => u.email === email) ||
+        null;
+    }
+
+    if (!account) {
+      return res.status(404).json({
+        error: 'Аккаунт не найден.'
+      });
+    }
+
+    if (account.email_verified) {
+      return res.status(400).json({
+        error: 'Почта уже подтверждена. Можно входить.'
+      });
+    }
+
+    const code = generateCode();
+    const expires = new Date(Date.now() + CODE_TTL_MS);
+
+    if (pool) {
+      await pool.query(
+        `UPDATE users
+         SET verification_code = $1,
+             verification_expires = $2,
+             verification_attempts = 0
+         WHERE id = $3`,
+        [code, expires, account.id]
+      );
+    } else {
+      account.verification_code = code;
+      account.verification_expires = expires.getTime();
+      account.verification_attempts = 0;
+    }
+
+    try {
+      await sendVerificationEmail(email, code);
+    } catch (mailError) {
+      console.error('Не удалось отправить письмо:', mailError);
+      return res.status(500).json({
+        error: 'Не удалось отправить письмо. Попробуй позже.'
+      });
+    }
+
+    res.json({ ok: true, email });
+  } catch (error) {
+    console.error('Ошибка повторной отправки кода:', error);
+
+    res.status(500).json({
+      error: 'Не удалось отправить код.'
     });
   }
 });
@@ -780,7 +1130,7 @@ app.post('/api/auth/login', async (req, res) => {
 
     if (pool) {
       const result = await pool.query(
-        `SELECT id, name, email, password_hash
+        `SELECT id, name, email, username, password_hash, email_verified
          FROM users
          WHERE LOWER(email) = $1
          LIMIT 1`,
@@ -789,9 +1139,9 @@ app.post('/api/auth/login', async (req, res) => {
 
       account = result.rows[0] || null;
     } else {
-      account = [...localAccounts.values()].find(
-        (user) => user.email === email
-      ) || null;
+      account =
+        [...localAccounts.values()].find((u) => u.email === email) ||
+        null;
     }
 
     if (
@@ -804,11 +1154,20 @@ app.post('/api/auth/login', async (req, res) => {
       });
     }
 
+    if (!account.email_verified) {
+      return res.status(403).json({
+        error: 'Почта не подтверждена. Введи код из письма.',
+        needsVerification: true,
+        email: account.email
+      });
+    }
+
     const token = await createSession(account.id);
 
     users.set(account.id, {
       id: account.id,
       name: account.name,
+      username: account.username,
       lastSeen: Date.now()
     });
 
@@ -884,7 +1243,7 @@ app.post('/api/auth/logout', async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// Совместимость со старой версией клиента
+// Старая совместимость
 // -----------------------------------------------------------------------------
 
 app.post('/api/register', async (req, res) => {
@@ -901,7 +1260,7 @@ app.post('/api/register', async (req, res) => {
 
     if (pool) {
       await pool.query(
-        'INSERT INTO users (id, name) VALUES ($1, $2)',
+        'INSERT INTO users (id, name, email_verified) VALUES ($1, $2, TRUE)',
         [id, name]
       );
     }
@@ -936,10 +1295,84 @@ app.use(
     '/api/state',
     '/api/call',
     '/api/token',
-    '/api/history'
+    '/api/history',
+    '/api/users'
   ],
   requireAuth
 );
+
+// -----------------------------------------------------------------------------
+// Поиск пользователей по @username
+// -----------------------------------------------------------------------------
+
+app.get('/api/users/search', async (req, res) => {
+  try {
+    const raw = typeof req.query.q === 'string' ? req.query.q : '';
+    const q = cleanUsername(raw);
+
+    if (q.length < 2) {
+      return res.json({ users: [] });
+    }
+
+    let rows = [];
+
+    if (pool) {
+      const result = await pool.query(
+        `SELECT id, name, username
+         FROM users
+         WHERE email_verified = TRUE
+           AND username IS NOT NULL
+           AND (
+             LOWER(username) = $1
+             OR LOWER(username) LIKE $2
+             OR LOWER(name) LIKE $2
+           )
+         ORDER BY
+           CASE WHEN LOWER(username) = $1 THEN 0 ELSE 1 END,
+           username
+         LIMIT 20`,
+        [q, `${q}%`]
+      );
+      rows = result.rows;
+    } else {
+      rows = [...localAccounts.values()]
+        .filter(
+          (u) =>
+            u.email_verified &&
+            u.username &&
+            (u.username === q ||
+              u.username.startsWith(q) ||
+              u.name.toLowerCase().startsWith(q))
+        )
+        .slice(0, 20)
+        .map((u) => ({
+          id: u.id,
+          name: u.name,
+          username: u.username
+        }));
+    }
+
+    const list = rows
+      .filter((row) => row.id !== req.authUser.id)
+      .map((row) => {
+        const active = users.get(row.id);
+        return publicUser({
+          id: row.id,
+          name: row.name,
+          username: row.username,
+          lastSeen: active?.lastSeen || 0
+        });
+      });
+
+    res.json({ users: list });
+  } catch (error) {
+    console.error('Ошибка поиска пользователей:', error);
+
+    res.status(500).json({
+      error: 'Не удалось выполнить поиск.'
+    });
+  }
+});
 
 // -----------------------------------------------------------------------------
 // История звонков
@@ -959,19 +1392,31 @@ app.get('/api/history', async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// Изменение имени
+// Изменение профиля (имя + ник)
 // -----------------------------------------------------------------------------
 
 app.post('/api/profile', async (req, res) => {
   try {
     const { userId } = req.body ?? {};
     const name = cleanName(req.body?.name);
+    const usernameRaw = req.body?.username;
+    const username =
+      typeof usernameRaw === 'string'
+        ? cleanUsername(usernameRaw)
+        : null;
 
     if (!requireOwnUserId(req, res, userId)) return;
 
     if (name.length < 2) {
       return res.status(400).json({
         error: 'Имя должно содержать минимум 2 символа.'
+      });
+    }
+
+    if (username !== null && !isValidUsername(username)) {
+      return res.status(400).json({
+        error:
+          'Ник должен быть от 3 до 32 символов (латиница, цифры, точка и _).'
       });
     }
 
@@ -984,16 +1429,48 @@ app.post('/api/profile', async (req, res) => {
     }
 
     if (pool) {
+      if (username) {
+        const taken = await pool.query(
+          `SELECT 1 FROM users
+           WHERE LOWER(username) = $1 AND id <> $2
+           LIMIT 1`,
+          [username, user.id]
+        );
+
+        if (taken.rowCount > 0) {
+          return res.status(409).json({
+            error: 'Этот ник уже занят.'
+          });
+        }
+      }
+
       await pool.query(
-        'UPDATE users SET name = $1 WHERE id = $2',
-        [name, user.id]
+        `UPDATE users
+         SET name = $1,
+             username = COALESCE($2, username)
+         WHERE id = $3`,
+        [name, username, user.id]
       );
     } else {
       const account = localAccounts.get(user.id);
-      if (account) account.name = name;
+      if (account) {
+        if (username) {
+          const taken = [...localAccounts.values()].some(
+            (u) => u.username === username && u.id !== user.id
+          );
+          if (taken) {
+            return res.status(409).json({
+              error: 'Этот ник уже занят.'
+            });
+          }
+          account.username = username;
+        }
+        account.name = name;
+      }
     }
 
     user.name = name;
+    if (username) user.username = username;
     user.lastSeen = Date.now();
 
     res.json({
@@ -1009,7 +1486,7 @@ app.post('/api/profile', async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// Состояние приложения
+// Состояние
 // -----------------------------------------------------------------------------
 
 app.get('/api/state', async (req, res) => {
@@ -1084,11 +1561,40 @@ app.post('/api/call', async (req, res) => {
     if (!requireOwnUserId(req, res, callerId)) return;
 
     const caller = await restoreUser(req.authUser.id);
-    const callee = touchUser(calleeId);
+    let callee = touchUser(calleeId);
+
+    // Если пользователь не в online-кэше — пробуем подтянуть из БД
+    if (!callee && pool) {
+      const result = await pool.query(
+        `SELECT id, name, username
+         FROM users
+         WHERE id = $1 AND email_verified = TRUE`,
+        [calleeId]
+      );
+
+      if (result.rowCount > 0) {
+        callee = {
+          id: result.rows[0].id,
+          name: result.rows[0].name,
+          username: result.rows[0].username,
+          lastSeen: 0
+        };
+      }
+    } else if (!callee && !pool) {
+      const account = localAccounts.get(calleeId);
+      if (account?.email_verified) {
+        callee = {
+          id: account.id,
+          name: account.name,
+          username: account.username,
+          lastSeen: 0
+        };
+      }
+    }
 
     if (!caller || !callee) {
       return res.status(404).json({
-        error: 'Пользователь не найден или отключился.'
+        error: 'Пользователь не найден.'
       });
     }
 
@@ -1098,7 +1604,7 @@ app.post('/api/call', async (req, res) => {
       });
     }
 
-    if (Date.now() - callee.lastSeen >= USER_TIMEOUT) {
+    if (Date.now() - (callee.lastSeen || 0) >= USER_TIMEOUT) {
       return res.status(409).json({
         error: 'Пользователь сейчас не в сети.'
       });
@@ -1107,12 +1613,10 @@ app.post('/api/call', async (req, res) => {
     const busy = [...calls.values()].some(
       (call) =>
         ['ringing', 'accepted'].includes(call.status) &&
-        (
-          call.from === callee.id ||
+        (call.from === callee.id ||
           call.to === callee.id ||
           call.from === caller.id ||
-          call.to === caller.id
-        )
+          call.to === caller.id)
     );
 
     if (busy) {
@@ -1136,7 +1640,6 @@ app.post('/api/call', async (req, res) => {
 
     calls.set(id, call);
 
-    // Звонок пока не сохраняем: запись появится после его завершения.
     res.json({
       call: getCallForUser(call, caller.id)
     });
@@ -1150,7 +1653,7 @@ app.post('/api/call', async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// Принятие звонка
+// Принятие / отклонение / завершение звонка + токен — без изменений логики
 // -----------------------------------------------------------------------------
 
 app.post('/api/call/:id/accept', async (req, res) => {
@@ -1189,10 +1692,6 @@ app.post('/api/call/:id/accept', async (req, res) => {
   }
 });
 
-// -----------------------------------------------------------------------------
-// Отклонение звонка
-// -----------------------------------------------------------------------------
-
 app.post('/api/call/:id/reject', async (req, res) => {
   try {
     const { userId } = req.body ?? {};
@@ -1228,10 +1727,6 @@ app.post('/api/call/:id/reject', async (req, res) => {
   }
 });
 
-// -----------------------------------------------------------------------------
-// Завершение звонка
-// -----------------------------------------------------------------------------
-
 app.post('/api/call/:id/end', async (req, res) => {
   try {
     const { userId } = req.body ?? {};
@@ -1265,19 +1760,14 @@ app.post('/api/call/:id/end', async (req, res) => {
   }
 });
 
-// -----------------------------------------------------------------------------
-// Токен LiveKit
-// -----------------------------------------------------------------------------
-
 app.post('/api/token', async (req, res) => {
   try {
     const { callId, userId, participantName } = req.body ?? {};
 
     if (!requireOwnUserId(req, res, userId)) return;
 
-    const call = typeof callId === 'string'
-      ? findCall(callId)
-      : null;
+    const call =
+      typeof callId === 'string' ? findCall(callId) : null;
 
     const user = await restoreUser(req.authUser.id);
 
@@ -1339,6 +1829,11 @@ async function startServer() {
 
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`Echo voice server запущен на порту ${PORT}`);
+      if (!mailTransport) {
+        console.warn(
+          'SMTP не настроен. Коды подтверждения будут в логах сервера.'
+        );
+      }
     });
   } catch (error) {
     console.error(

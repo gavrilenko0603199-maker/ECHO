@@ -1,4 +1,3 @@
-
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AudioLines,
@@ -24,7 +23,9 @@ import {
   LockKeyhole,
   UserRound,
   Eye,
-  EyeOff
+  EyeOff,
+  AtSign,
+  RefreshCw
 } from 'lucide-react';
 import { Room, RoomEvent, Track } from 'livekit-client';
 import './App.css';
@@ -32,6 +33,7 @@ import './App.css';
 type Contact = {
   id: string;
   name: string;
+  username?: string | null;
   email?: string;
   online?: boolean;
   status?: string;
@@ -87,12 +89,13 @@ type AuthResponse = {
     id: string;
     name: string;
     email: string;
+    username?: string | null;
     online?: boolean;
   };
   token: string;
 };
 
-type AuthMode = 'login' | 'register';
+type AuthMode = 'login' | 'register' | 'verify';
 
 type CallStatus =
   | 'idle'
@@ -114,12 +117,14 @@ const avatarColors = [
 ];
 
 function initialsOf(name: string) {
-  return name
-    .trim()
-    .split(/\s+/)
-    .slice(0, 2)
-    .map((part) => part[0]?.toUpperCase() ?? '')
-    .join('') || 'E';
+  return (
+    name
+      .trim()
+      .split(/\s+/)
+      .slice(0, 2)
+      .map((part) => part[0]?.toUpperCase() ?? '')
+      .join('') || 'E'
+  );
 }
 
 function colorOf(id: string) {
@@ -180,6 +185,15 @@ function formatCallTime(value: string) {
   })}, ${time}`;
 }
 
+function cleanUsernameInput(value: string) {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/^@+/, '')
+    .replace(/[^a-z0-9._]/g, '')
+    .slice(0, 32);
+}
+
 async function postJson<T>(
   path: string,
   body: Record<string, unknown>
@@ -198,11 +212,16 @@ async function postJson<T>(
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    throw new Error(
+    const err = new Error(
       typeof data.error === 'string'
         ? data.error
         : `Ошибка сервера (${response.status})`
-    );
+    ) as Error & { needsVerification?: boolean; email?: string };
+    if (data.needsVerification) {
+      err.needsVerification = true;
+      err.email = data.email;
+    }
+    throw err;
   }
 
   return data as T;
@@ -265,32 +284,85 @@ function Avatar({
   );
 }
 
+// -----------------------------------------------------------------------------
+// Экран авторизации + подтверждение кода
+// -----------------------------------------------------------------------------
+
 function AuthScreen({
   mode,
   setMode,
-  onAuthenticated
+  onAuthenticated,
+  verifyEmail,
+  setVerifyEmail
 }: {
   mode: AuthMode;
   setMode: (mode: AuthMode) => void;
   onAuthenticated: (result: AuthResponse) => void;
+  verifyEmail: string;
+  setVerifyEmail: (email: string) => void;
 }) {
   const [name, setName] = useState('');
+  const [username, setUsername] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [code, setCode] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [info, setInfo] = useState('');
 
   const isRegister = mode === 'register';
+  const isVerify = mode === 'verify';
 
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError('');
+    setInfo('');
+
+    if (isVerify) {
+      if (!/^\d{6}$/.test(code.trim())) {
+        setError('Введи 6-значный код из письма.');
+        return;
+      }
+
+      setBusy(true);
+      try {
+        const result = await postJson<AuthResponse>('/api/auth/verify', {
+          email: verifyEmail,
+          code: code.trim()
+        });
+
+        if (!result.token || !result.user?.id) {
+          throw new Error('Сервер вернул неполные данные аккаунта.');
+        }
+
+        localStorage.setItem(TOKEN_KEY, result.token);
+        localStorage.setItem('echo-display-name', result.user.name);
+        onAuthenticated(result);
+      } catch (err) {
+        setError(
+          err instanceof Error
+            ? err.message
+            : 'Не удалось подтвердить код.'
+        );
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
 
     if (isRegister && name.trim().length < 2) {
       setError('Имя должно содержать минимум 2 символа.');
       return;
+    }
+
+    if (isRegister) {
+      const clean = cleanUsernameInput(username);
+      if (clean.length < 3) {
+        setError('Ник должен содержать минимум 3 символа.');
+        return;
+      }
     }
 
     if (isRegister && password !== confirmPassword) {
@@ -306,33 +378,68 @@ function AuthScreen({
     setBusy(true);
 
     try {
-      const result = await postJson<AuthResponse>(
-        isRegister ? '/api/auth/register' : '/api/auth/login',
-        isRegister
-          ? {
-              name: name.trim(),
-              email: email.trim().toLowerCase(),
-              password
-            }
-          : {
-              email: email.trim().toLowerCase(),
-              password
-            }
-      );
+      if (isRegister) {
+        const result = await postJson<{
+          needsVerification?: boolean;
+          email?: string;
+        }>('/api/auth/register', {
+          name: name.trim(),
+          username: cleanUsernameInput(username),
+          email: email.trim().toLowerCase(),
+          password
+        });
 
-      if (!result.token || !result.user?.id) {
-        throw new Error('Сервер вернул неполные данные аккаунта.');
+        if (result.needsVerification) {
+          setVerifyEmail(result.email || email.trim().toLowerCase());
+          setMode('verify');
+          setInfo('Код отправлен на почту. Проверь входящие и спам.');
+          setCode('');
+          return;
+        }
+      } else {
+        const result = await postJson<AuthResponse>('/api/auth/login', {
+          email: email.trim().toLowerCase(),
+          password
+        });
+
+        if (!result.token || !result.user?.id) {
+          throw new Error('Сервер вернул неполные данные аккаунта.');
+        }
+
+        localStorage.setItem(TOKEN_KEY, result.token);
+        localStorage.setItem('echo-display-name', result.user.name);
+        onAuthenticated(result);
       }
-
-      localStorage.setItem(TOKEN_KEY, result.token);
-      localStorage.setItem('echo-display-name', result.user.name);
-
-      onAuthenticated(result);
     } catch (err) {
+      const e = err as Error & { needsVerification?: boolean; email?: string };
+      if (e.needsVerification) {
+        setVerifyEmail(e.email || email.trim().toLowerCase());
+        setMode('verify');
+        setInfo('Почта ещё не подтверждена. Введи код из письма.');
+        return;
+      }
       setError(
         err instanceof Error
           ? err.message
           : 'Не удалось выполнить запрос. Попробуй ещё раз.'
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function resendCode() {
+    if (!verifyEmail || busy) return;
+    setBusy(true);
+    setError('');
+    setInfo('');
+
+    try {
+      await postJson('/api/auth/resend-code', { email: verifyEmail });
+      setInfo('Новый код отправлен. Проверь почту.');
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : 'Не удалось отправить код.'
       );
     } finally {
       setBusy(false);
@@ -425,189 +532,292 @@ function AuthScreen({
               lineHeight: 1.6
             }}
           >
-            {isRegister
-              ? 'Создай аккаунт и оставайся на связи.'
-              : 'Рады снова тебя видеть.'}
+            {isVerify
+              ? `Код отправлен на ${verifyEmail}`
+              : isRegister
+                ? 'Создай аккаунт и оставайся на связи.'
+                : 'Рады снова тебя видеть.'}
           </p>
         </div>
 
-        <div
-          style={{
-            display: 'grid',
-            gridTemplateColumns: '1fr 1fr',
-            padding: 4,
-            gap: 4,
-            borderRadius: 13,
-            background: '#11111A',
-            marginBottom: 25
-          }}
-        >
-          <button
-            type="button"
-            onClick={() => {
-              setError('');
-              setMode('login');
-            }}
+        {!isVerify && (
+          <div
             style={{
-              height: 39,
-              border: 0,
-              borderRadius: 10,
-              cursor: 'pointer',
-              color: !isRegister ? '#FFFFFF' : '#9090A4',
-              background: !isRegister ? '#302B49' : 'transparent',
-              fontSize: 13,
-              fontWeight: 700
+              display: 'grid',
+              gridTemplateColumns: '1fr 1fr',
+              padding: 4,
+              gap: 4,
+              borderRadius: 13,
+              background: '#11111A',
+              marginBottom: 25
             }}
           >
-            Вход
-          </button>
+            <button
+              type="button"
+              onClick={() => {
+                setError('');
+                setInfo('');
+                setMode('login');
+              }}
+              style={{
+                height: 39,
+                border: 0,
+                borderRadius: 10,
+                cursor: 'pointer',
+                color: !isRegister ? '#FFFFFF' : '#9090A4',
+                background: !isRegister ? '#302B49' : 'transparent',
+                fontSize: 13,
+                fontWeight: 700
+              }}
+            >
+              Вход
+            </button>
 
-          <button
-            type="button"
-            onClick={() => {
-              setError('');
-              setMode('register');
-            }}
-            style={{
-              height: 39,
-              border: 0,
-              borderRadius: 10,
-              cursor: 'pointer',
-              color: isRegister ? '#FFFFFF' : '#9090A4',
-              background: isRegister ? '#302B49' : 'transparent',
-              fontSize: 13,
-              fontWeight: 700
-            }}
-          >
-            Регистрация
-          </button>
-        </div>
+            <button
+              type="button"
+              onClick={() => {
+                setError('');
+                setInfo('');
+                setMode('register');
+              }}
+              style={{
+                height: 39,
+                border: 0,
+                borderRadius: 10,
+                cursor: 'pointer',
+                color: isRegister ? '#FFFFFF' : '#9090A4',
+                background: isRegister ? '#302B49' : 'transparent',
+                fontSize: 13,
+                fontWeight: 700
+              }}
+            >
+              Регистрация
+            </button>
+          </div>
+        )}
 
         <form onSubmit={(event) => void submit(event)}>
-          {isRegister && (
-            <div style={{ marginBottom: 17 }}>
-              <label style={labelStyle}>Имя пользователя</label>
-              <div style={{ position: 'relative' }}>
-                <UserRound
-                  size={18}
-                  color="#85859D"
-                  style={{
-                    position: 'absolute',
-                    left: 14,
-                    top: 14
-                  }}
-                />
-                <input
-                  value={name}
-                  onChange={(event) => setName(event.target.value)}
-                  placeholder="Как тебя называть?"
-                  autoComplete="name"
-                  maxLength={48}
-                  required
-                  style={fieldStyle}
-                />
+          {isVerify ? (
+            <>
+              <div style={{ marginBottom: 17 }}>
+                <label style={labelStyle}>Код из письма</label>
+                <div style={{ position: 'relative' }}>
+                  <LockKeyhole
+                    size={18}
+                    color="#85859D"
+                    style={{
+                      position: 'absolute',
+                      left: 14,
+                      top: 14
+                    }}
+                  />
+                  <input
+                    value={code}
+                    onChange={(event) =>
+                      setCode(event.target.value.replace(/\D/g, '').slice(0, 6))
+                    }
+                    placeholder="6 цифр"
+                    inputMode="numeric"
+                    autoComplete="one-time-code"
+                    maxLength={6}
+                    required
+                    style={fieldStyle}
+                  />
+                </div>
               </div>
-            </div>
-          )}
 
-          <div style={{ marginBottom: 17 }}>
-            <label style={labelStyle}>Электронная почта</label>
-            <div style={{ position: 'relative' }}>
-              <Mail
-                size={18}
-                color="#85859D"
-                style={{
-                  position: 'absolute',
-                  left: 14,
-                  top: 14
-                }}
-              />
-              <input
-                type="email"
-                value={email}
-                onChange={(event) => setEmail(event.target.value)}
-                placeholder="name@example.com"
-                autoComplete="email"
-                maxLength={254}
-                required
-                style={fieldStyle}
-              />
-            </div>
-          </div>
-
-          <div style={{ marginBottom: 17 }}>
-            <label style={labelStyle}>Пароль</label>
-            <div style={{ position: 'relative' }}>
-              <LockKeyhole
-                size={18}
-                color="#85859D"
-                style={{
-                  position: 'absolute',
-                  left: 14,
-                  top: 14
-                }}
-              />
-              <input
-                type={showPassword ? 'text' : 'password'}
-                value={password}
-                onChange={(event) => setPassword(event.target.value)}
-                placeholder="Минимум 8 символов"
-                autoComplete={isRegister ? 'new-password' : 'current-password'}
-                minLength={8}
-                maxLength={128}
-                required
-                style={{ ...fieldStyle, paddingRight: 44 }}
-              />
               <button
                 type="button"
-                onClick={() => setShowPassword((value) => !value)}
-                aria-label={showPassword ? 'Скрыть пароль' : 'Показать пароль'}
+                onClick={() => void resendCode()}
+                disabled={busy}
                 style={{
-                  position: 'absolute',
-                  right: 12,
-                  top: 11,
-                  width: 26,
-                  height: 26,
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
                   background: 'transparent',
                   border: 0,
-                  padding: 0,
-                  color: '#85859D',
-                  cursor: 'pointer'
+                  color: '#8B78F6',
+                  fontSize: 13,
+                  cursor: busy ? 'wait' : 'pointer',
+                  marginBottom: 16,
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  padding: 0
                 }}
               >
-                {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+                <RefreshCw size={14} />
+                Отправить код ещё раз
               </button>
-            </div>
-          </div>
+            </>
+          ) : (
+            <>
+              {isRegister && (
+                <>
+                  <div style={{ marginBottom: 17 }}>
+                    <label style={labelStyle}>Имя</label>
+                    <div style={{ position: 'relative' }}>
+                      <UserRound
+                        size={18}
+                        color="#85859D"
+                        style={{
+                          position: 'absolute',
+                          left: 14,
+                          top: 14
+                        }}
+                      />
+                      <input
+                        value={name}
+                        onChange={(event) => setName(event.target.value)}
+                        placeholder="Как тебя называть?"
+                        autoComplete="name"
+                        maxLength={48}
+                        required
+                        style={fieldStyle}
+                      />
+                    </div>
+                  </div>
 
-          {isRegister && (
-            <div style={{ marginBottom: 18 }}>
-              <label style={labelStyle}>Повтори пароль</label>
-              <div style={{ position: 'relative' }}>
-                <Check
-                  size={18}
-                  color="#85859D"
-                  style={{
-                    position: 'absolute',
-                    left: 14,
-                    top: 14
-                  }}
-                />
-                <input
-                  type={showPassword ? 'text' : 'password'}
-                  value={confirmPassword}
-                  onChange={(event) => setConfirmPassword(event.target.value)}
-                  placeholder="Введи пароль ещё раз"
-                  autoComplete="new-password"
-                  maxLength={128}
-                  required
-                  style={fieldStyle}
-                />
+                  <div style={{ marginBottom: 17 }}>
+                    <label style={labelStyle}>Ник (@username)</label>
+                    <div style={{ position: 'relative' }}>
+                      <AtSign
+                        size={18}
+                        color="#85859D"
+                        style={{
+                          position: 'absolute',
+                          left: 14,
+                          top: 14
+                        }}
+                      />
+                      <input
+                        value={username}
+                        onChange={(event) =>
+                          setUsername(cleanUsernameInput(event.target.value))
+                        }
+                        placeholder="alex_1999"
+                        autoComplete="username"
+                        maxLength={32}
+                        required
+                        style={fieldStyle}
+                      />
+                    </div>
+                    <p
+                      style={{
+                        margin: '6px 0 0',
+                        color: '#6F6F86',
+                        fontSize: 12
+                      }}
+                    >
+                      Латиница, цифры, точка и _. От 3 символов.
+                    </p>
+                  </div>
+                </>
+              )}
+
+              <div style={{ marginBottom: 17 }}>
+                <label style={labelStyle}>Электронная почта</label>
+                <div style={{ position: 'relative' }}>
+                  <Mail
+                    size={18}
+                    color="#85859D"
+                    style={{
+                      position: 'absolute',
+                      left: 14,
+                      top: 14
+                    }}
+                  />
+                  <input
+                    type="email"
+                    value={email}
+                    onChange={(event) => setEmail(event.target.value)}
+                    placeholder="name@example.com"
+                    autoComplete="email"
+                    maxLength={254}
+                    required
+                    style={fieldStyle}
+                  />
+                </div>
               </div>
-            </div>
+
+              <div style={{ marginBottom: 17 }}>
+                <label style={labelStyle}>Пароль</label>
+                <div style={{ position: 'relative' }}>
+                  <LockKeyhole
+                    size={18}
+                    color="#85859D"
+                    style={{
+                      position: 'absolute',
+                      left: 14,
+                      top: 14
+                    }}
+                  />
+                  <input
+                    type={showPassword ? 'text' : 'password'}
+                    value={password}
+                    onChange={(event) => setPassword(event.target.value)}
+                    placeholder="Минимум 8 символов"
+                    autoComplete={
+                      isRegister ? 'new-password' : 'current-password'
+                    }
+                    minLength={8}
+                    maxLength={128}
+                    required
+                    style={{ ...fieldStyle, paddingRight: 44 }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword((value) => !value)}
+                    aria-label={
+                      showPassword ? 'Скрыть пароль' : 'Показать пароль'
+                    }
+                    style={{
+                      position: 'absolute',
+                      right: 12,
+                      top: 11,
+                      width: 26,
+                      height: 26,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      background: 'transparent',
+                      border: 0,
+                      padding: 0,
+                      color: '#85859D',
+                      cursor: 'pointer'
+                    }}
+                  >
+                    {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+                  </button>
+                </div>
+              </div>
+
+              {isRegister && (
+                <div style={{ marginBottom: 18 }}>
+                  <label style={labelStyle}>Повтори пароль</label>
+                  <div style={{ position: 'relative' }}>
+                    <Check
+                      size={18}
+                      color="#85859D"
+                      style={{
+                        position: 'absolute',
+                        left: 14,
+                        top: 14
+                      }}
+                    />
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      value={confirmPassword}
+                      onChange={(event) =>
+                        setConfirmPassword(event.target.value)
+                      }
+                      placeholder="Введи пароль ещё раз"
+                      autoComplete="new-password"
+                      maxLength={128}
+                      required
+                      style={fieldStyle}
+                    />
+                  </div>
+                </div>
+              )}
+            </>
           )}
 
           {error && (
@@ -626,6 +836,23 @@ function AuthScreen({
               }}
             >
               {error}
+            </div>
+          )}
+
+          {info && (
+            <div
+              style={{
+                padding: '11px 12px',
+                marginBottom: 17,
+                borderRadius: 10,
+                background: '#1E3A2F33',
+                border: '1px solid #3A7A5555',
+                color: '#8FDBB0',
+                fontSize: 13,
+                lineHeight: 1.5
+              }}
+            >
+              {info}
             </div>
           )}
 
@@ -654,39 +881,74 @@ function AuthScreen({
           >
             {busy
               ? 'Подожди…'
-              : isRegister
-                ? 'Создать аккаунт'
-                : 'Войти в Echo'}
+              : isVerify
+                ? 'Подтвердить и войти'
+                : isRegister
+                  ? 'Создать аккаунт'
+                  : 'Войти в Echo'}
           </button>
         </form>
 
-        <p
-          style={{
-            textAlign: 'center',
-            margin: '22px 0 0',
-            color: '#77778D',
-            fontSize: 12,
-            lineHeight: 1.6
-          }}
-        >
-          {isRegister
-            ? 'После регистрации ты сразу попадёшь в Echo.'
-            : 'Твой аккаунт и профиль сохраняются в базе данных.'}
-        </p>
+        {isVerify && (
+          <button
+            type="button"
+            onClick={() => {
+              setMode('login');
+              setError('');
+              setInfo('');
+              setCode('');
+            }}
+            style={{
+              width: '100%',
+              marginTop: 14,
+              background: 'transparent',
+              border: 0,
+              color: '#9090A4',
+              fontSize: 13,
+              cursor: 'pointer'
+            }}
+          >
+            ← Вернуться ко входу
+          </button>
+        )}
+
+        {!isVerify && (
+          <p
+            style={{
+              textAlign: 'center',
+              margin: '22px 0 0',
+              color: '#77778D',
+              fontSize: 12,
+              lineHeight: 1.6
+            }}
+          >
+            {isRegister
+              ? 'После регистрации придёт код на почту.'
+              : 'Твой аккаунт и профиль сохраняются в базе данных.'}
+          </p>
+        )}
       </div>
     </div>
   );
 }
 
+// -----------------------------------------------------------------------------
+// Основное приложение
+// -----------------------------------------------------------------------------
+
 function App() {
   const [authReady, setAuthReady] = useState(false);
   const [authenticated, setAuthenticated] = useState(false);
   const [authMode, setAuthMode] = useState<AuthMode>('login');
+  const [verifyEmail, setVerifyEmail] = useState('');
   const [myEmail, setMyEmail] = useState('');
+  const [myUsername, setMyUsername] = useState('');
   const [loggingOut, setLoggingOut] = useState(false);
 
   const [activeTab, setActiveTab] = useState('Звонки');
   const [search, setSearch] = useState('');
+  const [searchResults, setSearchResults] = useState<Contact[]>([]);
+  const [searching, setSearching] = useState(false);
   const [myName, setMyName] = useState(
     () => localStorage.getItem('echo-display-name') || 'Пользователь'
   );
@@ -709,14 +971,24 @@ function App() {
   const callStartedAtRef = useRef<number | null>(null);
   const attemptRef = useRef(0);
   const endedCallIdsRef = useRef(new Set<string>());
+  const searchTimerRef = useRef<number | null>(null);
 
-  const filteredContacts = contacts.filter((contact) =>
-    contact.name.toLowerCase().includes(search.toLowerCase())
-  );
+  const filteredContacts = contacts.filter((contact) => {
+    const q = search.toLowerCase().replace(/^@/, '');
+    return (
+      contact.name.toLowerCase().includes(q) ||
+      (contact.username || '').toLowerCase().includes(q)
+    );
+  });
 
   const filteredCalls = calls.filter((call) =>
     call.name.toLowerCase().includes(search.toLowerCase())
   );
+
+  const displayContacts =
+    search.trim().length >= 2 && searchResults.length > 0
+      ? searchResults
+      : filteredContacts;
 
   const refreshHistory = useCallback(async () => {
     if (!localStorage.getItem(TOKEN_KEY)) return;
@@ -726,9 +998,7 @@ function App() {
         '/api/history'
       );
 
-      setCalls(
-        (result.history || []).map(mapServerHistory)
-      );
+      setCalls((result.history || []).map(mapServerHistory));
     } catch (error) {
       console.error('Не удалось обновить историю звонков:', error);
     }
@@ -750,10 +1020,7 @@ function App() {
 
   const joinCall = useCallback(
     async (call: ServerCall, myId: string, displayName: string) => {
-      if (
-        joiningCallIdRef.current === call.id ||
-        roomRef.current
-      ) {
+      if (joiningCallIdRef.current === call.id || roomRef.current) {
         return;
       }
 
@@ -818,10 +1085,7 @@ function App() {
           }
         });
 
-        await room.connect(
-          tokenData.serverUrl,
-          tokenData.participantToken
-        );
+        await room.connect(tokenData.serverUrl, tokenData.participantToken);
 
         if (attempt !== attemptRef.current) {
           await room.disconnect();
@@ -864,7 +1128,50 @@ function App() {
     []
   );
 
-  // Восстанавливаем аккаунт из сохранённой серверной сессии.
+  // Поиск по @username (с задержкой)
+  useEffect(() => {
+    if (!authenticated) {
+      setSearchResults([]);
+      return;
+    }
+
+    const q = search.trim();
+
+    if (q.length < 2) {
+      setSearchResults([]);
+      return;
+    }
+
+    if (searchTimerRef.current) {
+      window.clearTimeout(searchTimerRef.current);
+    }
+
+    searchTimerRef.current = window.setTimeout(() => {
+      void (async () => {
+        setSearching(true);
+        try {
+          const result = await getJson<{ users: Contact[] }>(
+            `/api/users/search?q=${encodeURIComponent(q)}`
+          );
+          setSearchResults(
+            (result.users || []).map((u) => contactFromServer(u))
+          );
+        } catch {
+          setSearchResults([]);
+        } finally {
+          setSearching(false);
+        }
+      })();
+    }, 350);
+
+    return () => {
+      if (searchTimerRef.current) {
+        window.clearTimeout(searchTimerRef.current);
+      }
+    };
+  }, [search, authenticated]);
+
+  // Восстанавливаем сессию
   useEffect(() => {
     let cancelled = false;
 
@@ -903,6 +1210,7 @@ function App() {
         setUserId(user.id);
         setMyName(user.name);
         setMyEmail(user.email);
+        setMyUsername(user.username || '');
         localStorage.setItem('echo-display-name', user.name);
         setAuthenticated(true);
         setConnectionOnline(true);
@@ -932,14 +1240,13 @@ function App() {
     setUserId(result.user.id);
     setMyName(result.user.name);
     setMyEmail(result.user.email);
+    setMyUsername(result.user.username || '');
     setAuthenticated(true);
     setConnectionOnline(true);
     setCallError('');
     setAuthReady(true);
   }, []);
 
-  // Загружаем сохранённую историю после входа и периодически обновляем её,
-  // чтобы видеть завершённые и пропущенные вызовы на других устройствах.
   useEffect(() => {
     if (!authenticated || !userId) {
       setCalls([]);
@@ -972,7 +1279,7 @@ function App() {
         });
       }
     } catch {
-      // Локальный выход всё равно выполняется при отсутствии сети.
+      // локальный выход
     }
 
     attemptRef.current += 1;
@@ -987,8 +1294,10 @@ function App() {
     setAuthenticated(false);
     setUserId('');
     setMyEmail('');
+    setMyUsername('');
     setContacts([]);
     setCalls([]);
+    setSearchResults([]);
     setIncomingCall(null);
     setSelectedContact(null);
     setCurrentCallId('');
@@ -1017,9 +1326,7 @@ function App() {
         const response = await fetch(
           `${API_URL}/api/state?userId=${encodeURIComponent(userId)}`,
           {
-            headers: token
-              ? { Authorization: `Bearer ${token}` }
-              : {}
+            headers: token ? { Authorization: `Bearer ${token}` } : {}
           }
         );
 
@@ -1032,9 +1339,7 @@ function App() {
         if (cancelled) return;
 
         setConnectionOnline(true);
-        setContacts(
-          state.users.map((user) => contactFromServer(user))
-        );
+        setContacts(state.users.map((user) => contactFromServer(user)));
 
         if (state.incomingCall) {
           setIncomingCall(state.incomingCall);
@@ -1049,10 +1354,7 @@ function App() {
         if (state.activeCall) {
           const active = state.activeCall;
 
-          if (
-            joiningCallIdRef.current !== active.id &&
-            !roomRef.current
-          ) {
+          if (joiningCallIdRef.current !== active.id && !roomRef.current) {
             void joinCall(active, userId, myName);
           }
         }
@@ -1127,17 +1429,36 @@ function App() {
       return;
     }
 
+    const proposedUsername = window.prompt(
+      'Твой ник (@username). Оставь пустым, чтобы не менять.',
+      myUsername || ''
+    );
+
+    if (proposedUsername === null) return;
+
+    const username = cleanUsernameInput(proposedUsername);
+
+    if (username && username.length < 3) {
+      setCallError('Ник должен содержать минимум 3 символа.');
+      return;
+    }
+
     setMyName(name);
     localStorage.setItem('echo-display-name', name);
+    if (username) setMyUsername(username);
 
     if (!userId) return;
 
     try {
-      await postJson('/api/profile', { userId, name });
+      await postJson('/api/profile', {
+        userId,
+        name,
+        ...(username ? { username } : {})
+      });
       setCallError('');
     } catch (error) {
       setCallError(
-        error instanceof Error ? error.message : 'Не удалось изменить имя.'
+        error instanceof Error ? error.message : 'Не удалось изменить профиль.'
       );
     }
   }
@@ -1242,7 +1563,7 @@ function App() {
       try {
         await room.disconnect();
       } catch {
-        // Продолжаем завершение вызова на сервере.
+        // продолжаем
       }
     }
 
@@ -1293,6 +1614,8 @@ function App() {
         mode={authMode}
         setMode={setAuthMode}
         onAuthenticated={handleAuthenticated}
+        verifyEmail={verifyEmail}
+        setVerifyEmail={setVerifyEmail}
       />
     );
   }
@@ -1314,7 +1637,9 @@ function App() {
           <div className="profile-avatar">{initialsOf(myName)}</div>
           <div className="profile-info">
             <strong>{myName}</strong>
-            <span>Мой аккаунт</span>
+            <span>
+              {myUsername ? `@${myUsername}` : 'Мой аккаунт'}
+            </span>
           </div>
           <MoreHorizontal size={20} className="muted-icon" />
         </button>
@@ -1379,7 +1704,7 @@ function App() {
 
           <div className="sidebar-footer">
             <span>Echo Desktop</span>
-            <span>v1.1.0</span>
+            <span>v1.2.0</span>
           </div>
         </div>
       </aside>
@@ -1433,10 +1758,26 @@ function App() {
                   </div>
                   <div>
                     <strong>Твой профиль</strong>
-                    <p>Нажми, чтобы изменить имя</p>
+                    <p>Имя и @ник</p>
                   </div>
-                  <span className="settings-value">{myName}</span>
+                  <span className="settings-value">
+                    {myName}
+                    {myUsername ? ` · @${myUsername}` : ''}
+                  </span>
                 </button>
+
+                <div className="settings-row">
+                  <div className="settings-icon">
+                    <AtSign size={21} />
+                  </div>
+                  <div>
+                    <strong>Ник</strong>
+                    <p>По нему тебя находят другие</p>
+                  </div>
+                  <span className="settings-value">
+                    {myUsername ? `@${myUsername}` : 'не задан'}
+                  </span>
+                </div>
 
                 <div className="settings-row">
                   <div className="settings-icon">
@@ -1484,14 +1825,14 @@ function App() {
                   <div className="eyebrow">ТВОЁ ПРОСТРАНСТВО ДЛЯ ОБЩЕНИЯ</div>
                   <h1>
                     {activeTab === 'Контакты'
-                      ? 'Пользователи онлайн'
+                      ? 'Поиск и контакты'
                       : activeTab === 'Недавние'
                         ? 'История звонков'
                         : 'На связи?'}
                   </h1>
                   <p>
                     {activeTab === 'Контакты'
-                      ? 'Выбирай пользователя и звони ему.'
+                      ? 'Ищи людей по @нику или звони тем, кто в сети.'
                       : activeTab === 'Недавние'
                         ? 'Твои последние разговоры.'
                         : 'Иногда один звонок меняет весь день.'}
@@ -1525,7 +1866,7 @@ function App() {
                     </h2>
 
                     <p>
-                      Выбирай пользователя онлайн и начинай разговор.
+                      Найди человека по @нику и начни разговор.
                       <br />
                       Просто, удобно, без лишнего.
                     </p>
@@ -1566,14 +1907,18 @@ function App() {
                   <div>
                     <h2>
                       {activeTab === 'Контакты'
-                        ? 'Кто сейчас в сети'
+                        ? search.trim().length >= 2
+                          ? 'Результаты поиска'
+                          : 'Кто сейчас в сети'
                         : activeTab === 'Недавние'
                           ? 'Последние разговоры'
                           : 'Недавние звонки'}
                     </h2>
                     <span>
                       {activeTab === 'Контакты'
-                        ? `${filteredContacts.length} пользователей`
+                        ? searching
+                          ? 'Ищем…'
+                          : `${displayContacts.length} пользователей`
                         : `${filteredCalls.length} звонков`}
                     </span>
                   </div>
@@ -1583,7 +1928,11 @@ function App() {
                     <input
                       value={search}
                       onChange={(event) => setSearch(event.target.value)}
-                      placeholder="Поиск..."
+                      placeholder={
+                        activeTab === 'Контакты'
+                          ? 'Поиск по @нику или имени...'
+                          : 'Поиск...'
+                      }
                     />
                     {search && (
                       <button
@@ -1599,20 +1948,26 @@ function App() {
 
                 {activeTab === 'Контакты' ? (
                   <div className="contacts-grid">
-                    {filteredContacts.map((contact) => (
+                    {displayContacts.map((contact) => (
                       <article className="contact-card" key={contact.id}>
                         <div className="contact-card-top">
                           <Avatar
                             initials={contact.initials}
                             color={contact.color}
-                            online
+                            online={Boolean(contact.online)}
                             size="large"
                           />
                           <button
                             className="more-button"
                             aria-label="Дополнительно"
                             onClick={() => {
-                              setCallError(`Пользователь: ${contact.name}`);
+                              setCallError(
+                                `${contact.name}${
+                                  contact.username
+                                    ? ` · @${contact.username}`
+                                    : ''
+                                }`
+                              );
                             }}
                           >
                             <MoreHorizontal size={19} />
@@ -1620,24 +1975,52 @@ function App() {
                         </div>
 
                         <strong>{contact.name}</strong>
-                        <span className="contact-status">В сети</span>
+                        <span className="contact-status">
+                          {contact.username
+                            ? `@${contact.username}`
+                            : contact.online
+                              ? 'В сети'
+                              : 'Не в сети'}
+                        </span>
+                        {contact.username && (
+                          <span
+                            style={{
+                              fontSize: 12,
+                              color: contact.online ? '#48C78E' : '#8A8A9E',
+                              marginTop: 2
+                            }}
+                          >
+                            {contact.online ? 'В сети' : 'Не в сети'}
+                          </span>
+                        )}
 
                         <button
                           className="contact-call-button"
-                          disabled={busyAction || !userId}
+                          disabled={
+                            busyAction || !userId || !contact.online
+                          }
                           onClick={() => void startCall(contact)}
+                          title={
+                            contact.online
+                              ? 'Позвонить'
+                              : 'Пользователь не в сети'
+                          }
                         >
                           <PhoneCall size={17} />
-                          Позвонить
+                          {contact.online ? 'Позвонить' : 'Не в сети'}
                         </button>
                       </article>
                     ))}
 
-                    {filteredContacts.length === 0 && (
+                    {displayContacts.length === 0 && (
                       <div className="empty-state">
-                        {connectionOnline
-                          ? 'Пока никого нет в сети. Открой Echo в другом окне или на другом устройстве.'
-                          : 'Подключаемся к серверу Echo…'}
+                        {search.trim().length >= 2
+                          ? searching
+                            ? 'Ищем пользователей…'
+                            : 'Никого не нашли. Проверь ник и попробуй ещё раз.'
+                          : connectionOnline
+                            ? 'Пока никого нет в сети. Найди человека по @нику в поиске выше.'
+                            : 'Подключаемся к серверу Echo…'}
                       </div>
                     )}
                   </div>
@@ -1668,7 +2051,9 @@ function App() {
                         </div>
 
                         <span
-                          className={`call-duration ${call.type === 'missed' ? 'missed-text' : ''}`}
+                          className={`call-duration ${
+                            call.type === 'missed' ? 'missed-text' : ''
+                          }`}
                         >
                           {call.duration}
                         </span>
@@ -1701,7 +2086,9 @@ function App() {
                     <strong>Голосовые звонки через LiveKit</strong>
                     <p>
                       {connectionOnline
-                        ? `Ты вошёл как ${myName}. Можно звонить пользователям онлайн.`
+                        ? `Ты вошёл как ${myName}${
+                            myUsername ? ` (@${myUsername})` : ''
+                          }. Ищи людей по нику.`
                         : 'Запусти сервер Echo, чтобы подключиться.'}
                     </p>
                   </div>
@@ -1743,6 +2130,11 @@ function App() {
             </div>
 
             <h2>{selectedContact.name}</h2>
+            {selectedContact.username && (
+              <p style={{ color: '#8B78F6', margin: '0 0 8px', fontSize: 14 }}>
+                @{selectedContact.username}
+              </p>
+            )}
 
             <p className="call-modal-status">
               {callStatus === 'ringing'
@@ -1791,8 +2183,12 @@ function App() {
                 className="call-control-button"
                 onClick={() => void toggleMicrophone()}
                 disabled={callStatus !== 'connected'}
-                aria-label={micEnabled ? 'Выключить микрофон' : 'Включить микрофон'}
-                title={micEnabled ? 'Выключить микрофон' : 'Включить микрофон'}
+                aria-label={
+                  micEnabled ? 'Выключить микрофон' : 'Включить микрофон'
+                }
+                title={
+                  micEnabled ? 'Выключить микрофон' : 'Включить микрофон'
+                }
               >
                 {micEnabled ? <Mic size={21} /> : <MicOff size={21} />}
               </button>
@@ -1841,6 +2237,11 @@ function App() {
             </div>
 
             <h2>{incomingCall.caller.name}</h2>
+            {incomingCall.caller.username && (
+              <p style={{ color: '#8B78F6', margin: '0 0 8px', fontSize: 14 }}>
+                @{incomingCall.caller.username}
+              </p>
+            )}
             <p className="call-modal-status">Входящий голосовой вызов</p>
             <p className="call-modal-notice">
               Пользователь хочет поговорить с тобой.

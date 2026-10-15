@@ -2197,8 +2197,8 @@ function App() {
                       {activeTab === 'Контакты'
                         ? searching
                           ? 'Ищем…'
-                          : `${displayContacts.length} пользователей`
-                        : `${filteredCalls.length} звонков`}
+                          : `${displayContacts.length} ${displayContacts.length === 1 ? 'человек' : 'пользователей'}`
+                        : `${filteredCalls.length} ${filteredCalls.length === 1 ? 'звонок' : filteredCalls.length < 5 ? 'звонка' : 'звонков'}`}
                     </span>
                   </div>
 

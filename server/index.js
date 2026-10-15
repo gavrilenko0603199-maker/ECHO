@@ -215,11 +215,45 @@ async function initDatabase() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS conversations (
+      id TEXT PRIMARY KEY,
+      user_a TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      user_b TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS conversations_pair_unique
+    ON conversations (
+      LEAST(user_a, user_b),
+      GREATEST(user_a, user_b)
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      sender_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      body TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      read_at TIMESTAMPTZ
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS messages_conversation_idx
+    ON messages(conversation_id, created_at DESC)
+  `);
+
+  await pool.query(`
     DELETE FROM sessions WHERE expires_at <= NOW()
   `);
 
   console.log(
-    'PostgreSQL подключён. Таблицы пользователей, сессий и истории звонков готовы.'
+    'PostgreSQL подключён. Таблицы пользователей, сессий, истории и чатов готовы.'
   );
 }
 
@@ -561,6 +595,62 @@ async function getCallHistory(userId) {
   }
 
   return Promise.all(rows.map((row) => historyItem(row, userId)));
+}
+
+// -----------------------------------------------------------------------------
+// Чаты — вспомогательные функции
+// -----------------------------------------------------------------------------
+
+function pairUsers(id1, id2) {
+  return id1 < id2 ? [id1, id2] : [id2, id1];
+}
+
+async function findOrCreateConversation(userId, otherId) {
+  if (!pool) {
+    throw new Error('DATABASE_URL required for chats');
+  }
+
+  const [userA, userB] = pairUsers(userId, otherId);
+
+  const existing = await pool.query(
+    `SELECT id, user_a, user_b, created_at, updated_at
+     FROM conversations
+     WHERE user_a = $1 AND user_b = $2
+     LIMIT 1`,
+    [userA, userB]
+  );
+
+  if (existing.rowCount > 0) return existing.rows[0];
+
+  const id = crypto.randomUUID();
+  const inserted = await pool.query(
+    `INSERT INTO conversations (id, user_a, user_b)
+     VALUES ($1, $2, $3)
+     RETURNING id, user_a, user_b, created_at, updated_at`,
+    [id, userA, userB]
+  );
+
+  return inserted.rows[0];
+}
+
+async function getOtherParticipant(conv, meId) {
+  const otherId = conv.user_a === meId ? conv.user_b : conv.user_a;
+
+  if (!pool) {
+    return { id: otherId, name: 'Пользователь', username: null };
+  }
+
+  const result = await pool.query(
+    `SELECT id, name, username FROM users
+     WHERE id = $1 AND email_verified = TRUE`,
+    [otherId]
+  );
+
+  if (result.rowCount === 0) {
+    return { id: otherId, name: 'Пользователь', username: null };
+  }
+
+  return result.rows[0];
 }
 
 // -----------------------------------------------------------------------------
@@ -1271,7 +1361,8 @@ app.use(
     '/api/call',
     '/api/token',
     '/api/history',
-    '/api/users'
+    '/api/users',
+    '/api/conversations'
   ],
   requireAuth
 );
@@ -1346,6 +1437,275 @@ app.get('/api/users/search', async (req, res) => {
     res.status(500).json({
       error: 'Не удалось выполнить поиск.'
     });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Чаты
+// -----------------------------------------------------------------------------
+
+app.get('/api/conversations', async (req, res) => {
+  try {
+    if (!pool) {
+      return res.status(503).json({ error: 'База данных недоступна.' });
+    }
+
+    const me = req.authUser.id;
+
+    const result = await pool.query(
+      `SELECT
+         c.id,
+         c.user_a,
+         c.user_b,
+         c.updated_at,
+         (
+           SELECT m.body FROM messages m
+           WHERE m.conversation_id = c.id
+           ORDER BY m.created_at DESC
+           LIMIT 1
+         ) AS last_body,
+         (
+           SELECT m.created_at FROM messages m
+           WHERE m.conversation_id = c.id
+           ORDER BY m.created_at DESC
+           LIMIT 1
+         ) AS last_at,
+         (
+           SELECT COUNT(*)::int FROM messages m
+           WHERE m.conversation_id = c.id
+             AND m.sender_id <> $1
+             AND m.read_at IS NULL
+         ) AS unread
+       FROM conversations c
+       WHERE c.user_a = $1 OR c.user_b = $1
+       ORDER BY COALESCE(
+         (SELECT m.created_at FROM messages m
+          WHERE m.conversation_id = c.id
+          ORDER BY m.created_at DESC LIMIT 1),
+         c.updated_at
+       ) DESC
+       LIMIT 100`,
+      [me]
+    );
+
+    const list = await Promise.all(
+      result.rows.map(async (row) => {
+        const other = await getOtherParticipant(row, me);
+        const active = users.get(other.id);
+        return {
+          id: row.id,
+          other: publicUser({
+            id: other.id,
+            name: other.name,
+            username: other.username,
+            lastSeen: active?.lastSeen || 0
+          }),
+          lastMessage: row.last_body
+            ? { body: row.last_body, createdAt: row.last_at }
+            : null,
+          unread: row.unread || 0
+        };
+      })
+    );
+
+    res.json({ conversations: list });
+  } catch (error) {
+    console.error('Ошибка списка диалогов:', error);
+    res.status(500).json({ error: 'Не удалось загрузить чаты.' });
+  }
+});
+
+app.post('/api/conversations', async (req, res) => {
+  try {
+    if (!pool) {
+      return res.status(503).json({ error: 'База данных недоступна.' });
+    }
+
+    const otherId =
+      typeof req.body?.userId === 'string' ? req.body.userId.trim() : '';
+
+    if (!otherId || otherId === req.authUser.id) {
+      return res.status(400).json({
+        error: 'Укажи другого пользователя.'
+      });
+    }
+
+    const otherCheck = await pool.query(
+      `SELECT id, name, username FROM users
+       WHERE id = $1 AND email_verified = TRUE`,
+      [otherId]
+    );
+
+    if (otherCheck.rowCount === 0) {
+      return res.status(404).json({ error: 'Пользователь не найден.' });
+    }
+
+    const conv = await findOrCreateConversation(req.authUser.id, otherId);
+    const other = otherCheck.rows[0];
+    const active = users.get(other.id);
+
+    res.json({
+      conversation: {
+        id: conv.id,
+        other: publicUser({
+          id: other.id,
+          name: other.name,
+          username: other.username,
+          lastSeen: active?.lastSeen || 0
+        })
+      }
+    });
+  } catch (error) {
+    console.error('Ошибка создания диалога:', error);
+    res.status(500).json({ error: 'Не удалось открыть чат.' });
+  }
+});
+
+app.get('/api/conversations/:id/messages', async (req, res) => {
+  try {
+    if (!pool) {
+      return res.status(503).json({ error: 'База данных недоступна.' });
+    }
+
+    const me = req.authUser.id;
+    const convId = req.params.id;
+
+    const convResult = await pool.query(
+      `SELECT id, user_a, user_b FROM conversations WHERE id = $1`,
+      [convId]
+    );
+
+    if (convResult.rowCount === 0) {
+      return res.status(404).json({ error: 'Диалог не найден.' });
+    }
+
+    const conv = convResult.rows[0];
+    if (conv.user_a !== me && conv.user_b !== me) {
+      return res.status(403).json({ error: 'Нет доступа к этому чату.' });
+    }
+
+    await pool.query(
+      `UPDATE messages
+       SET read_at = NOW()
+       WHERE conversation_id = $1
+         AND sender_id <> $2
+         AND read_at IS NULL`,
+      [convId, me]
+    );
+
+    const before =
+      typeof req.query.before === 'string' ? req.query.before : null;
+
+    let messagesResult;
+    if (before) {
+      messagesResult = await pool.query(
+        `SELECT id, sender_id, body, created_at, read_at
+         FROM messages
+         WHERE conversation_id = $1 AND created_at < $2
+         ORDER BY created_at DESC
+         LIMIT 50`,
+        [convId, before]
+      );
+    } else {
+      messagesResult = await pool.query(
+        `SELECT id, sender_id, body, created_at, read_at
+         FROM messages
+         WHERE conversation_id = $1
+         ORDER BY created_at DESC
+         LIMIT 50`,
+        [convId]
+      );
+    }
+
+    const messages = messagesResult.rows
+      .map((m) => ({
+        id: m.id,
+        senderId: m.sender_id,
+        body: m.body,
+        createdAt: m.created_at,
+        readAt: m.read_at,
+        mine: m.sender_id === me
+      }))
+      .reverse();
+
+    const other = await getOtherParticipant(conv, me);
+
+    res.json({
+      conversationId: convId,
+      other: publicUser({
+        id: other.id,
+        name: other.name,
+        username: other.username,
+        lastSeen: users.get(other.id)?.lastSeen || 0
+      }),
+      messages
+    });
+  } catch (error) {
+    console.error('Ошибка загрузки сообщений:', error);
+    res.status(500).json({ error: 'Не удалось загрузить сообщения.' });
+  }
+});
+
+app.post('/api/conversations/:id/messages', async (req, res) => {
+  try {
+    if (!pool) {
+      return res.status(503).json({ error: 'База данных недоступна.' });
+    }
+
+    const me = req.authUser.id;
+    const convId = req.params.id;
+    const body =
+      typeof req.body?.body === 'string' ? req.body.body.trim() : '';
+
+    if (!body || body.length > 4000) {
+      return res.status(400).json({
+        error: 'Сообщение должно быть от 1 до 4000 символов.'
+      });
+    }
+
+    const convResult = await pool.query(
+      `SELECT id, user_a, user_b FROM conversations WHERE id = $1`,
+      [convId]
+    );
+
+    if (convResult.rowCount === 0) {
+      return res.status(404).json({ error: 'Диалог не найден.' });
+    }
+
+    const conv = convResult.rows[0];
+    if (conv.user_a !== me && conv.user_b !== me) {
+      return res.status(403).json({ error: 'Нет доступа к этому чату.' });
+    }
+
+    const id = crypto.randomUUID();
+
+    const inserted = await pool.query(
+      `INSERT INTO messages (id, conversation_id, sender_id, body)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, sender_id, body, created_at, read_at`,
+      [id, convId, me, body]
+    );
+
+    await pool.query(
+      `UPDATE conversations SET updated_at = NOW() WHERE id = $1`,
+      [convId]
+    );
+
+    const m = inserted.rows[0];
+
+    res.status(201).json({
+      message: {
+        id: m.id,
+        senderId: m.sender_id,
+        body: m.body,
+        createdAt: m.created_at,
+        readAt: m.read_at,
+        mine: true
+      }
+    });
+  } catch (error) {
+    console.error('Ошибка отправки сообщения:', error);
+    res.status(500).json({ error: 'Не удалось отправить сообщение.' });
   }
 });
 
@@ -1809,7 +2169,7 @@ async function startServer() {
     });
   } catch (error) {
     console.error(
-      'Не удалось запустить Echo',
+      'Не удалось запустить Echo или подключить PostgreSQL:',
       error
     );
 

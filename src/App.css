@@ -384,6 +384,12 @@ input:focus-visible {
   transform: translateY(-1px);
 }
 
+.primary-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
 .hero-card {
   position: relative;
   display: flex;
@@ -872,6 +878,14 @@ input:focus-visible {
   font-size: 10px;
 }
 
+.contact-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  margin-top: 18px;
+}
+
 .contact-call-button {
   display: flex;
   align-items: center;
@@ -879,7 +893,7 @@ input:focus-visible {
   gap: 8px;
   width: 100%;
   min-height: 38px;
-  margin-top: 18px;
+  margin-top: 0;
   border: 1px solid #413452;
   border-radius: 9px;
   color: #c6b7ff;
@@ -1122,7 +1136,175 @@ input:focus-visible {
   letter-spacing: 2px;
 }
 
-/* ---------- tablet ---------- */
+/* chats */
+.chat-error {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #5a263333;
+  border: 1px solid #a94f6755;
+  color: #f0a6b5;
+  font-size: 13px;
+}
+
+.chats-layout {
+  display: flex;
+  gap: 0;
+  min-height: 420px;
+  border: 1px solid #25242e;
+  border-radius: 14px;
+  overflow: hidden;
+  background: #111116;
+}
+
+.chats-list {
+  width: 320px;
+  flex-shrink: 0;
+  border-right: 1px solid #25242e;
+  overflow-y: auto;
+  max-height: 70vh;
+}
+
+.chat-list-item {
+  display: flex;
+  gap: 12px;
+  width: 100%;
+  padding: 14px 16px;
+  border: 0;
+  border-bottom: 1px solid #1e1d26;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chat-list-item:hover,
+.chat-list-item.active {
+  background: #17161e;
+}
+
+.chat-list-item .meta {
+  flex: 1;
+  min-width: 0;
+}
+
+.chat-list-item strong {
+  display: block;
+  font-size: 13px;
+}
+
+.chat-list-item .preview {
+  margin-top: 4px;
+  color: #858393;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-unread {
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 10px;
+  background: #7c5cff;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  display: grid;
+  place-items: center;
+  align-self: center;
+}
+
+.chat-thread {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 420px;
+  max-height: 70vh;
+}
+
+.chat-thread-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid #25242e;
+}
+
+.chat-thread-header strong {
+  display: block;
+  font-size: 13px;
+}
+
+.chat-thread-header .preview {
+  margin-top: 3px;
+  color: #858393;
+  font-size: 11px;
+}
+
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chat-bubble {
+  max-width: 75%;
+  padding: 10px 12px;
+  border-radius: 14px;
+  font-size: 13px;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.chat-bubble.mine {
+  align-self: flex-end;
+  background: linear-gradient(130deg, #7c5cff, #6344d8);
+  color: #fff;
+  border-bottom-right-radius: 4px;
+}
+
+.chat-bubble.theirs {
+  align-self: flex-start;
+  background: #1c1b24;
+  border: 1px solid #2a2934;
+  border-bottom-left-radius: 4px;
+}
+
+.chat-bubble time {
+  display: block;
+  margin-top: 4px;
+  font-size: 10px;
+  opacity: 0.7;
+}
+
+.chat-compose {
+  display: flex;
+  gap: 10px;
+  padding: 12px 14px;
+  border-top: 1px solid #25242e;
+}
+
+.chat-compose input {
+  flex: 1;
+  min-height: 42px;
+  padding: 0 14px;
+  border: 1px solid #292832;
+  border-radius: 10px;
+  background: #121218;
+  color: #f0edf8;
+  outline: none;
+}
+
+.chat-compose input:focus {
+  border-color: #7863ce;
+}
+
 @media (max-width: 1150px) {
   .sidebar {
     width: 220px;
@@ -1182,7 +1364,6 @@ input:focus-visible {
   }
 }
 
-/* ---------- iPhone / mobile ---------- */
 @media (max-width: 768px) {
   .app-shell {
     flex-direction: column;
@@ -1386,6 +1567,23 @@ input:focus-visible {
   .hangup-button {
     width: 68px;
     height: 68px;
+  }
+
+  .chats-layout {
+    flex-direction: column;
+    min-height: 60vh;
+  }
+
+  .chats-list {
+    width: 100%;
+    max-height: 35vh;
+    border-right: none;
+    border-bottom: 1px solid #25242e;
+  }
+
+  .chat-thread {
+    max-height: none;
+    min-height: 45vh;
   }
 }
 

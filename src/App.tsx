@@ -25,7 +25,9 @@ import {
   Eye,
   EyeOff,
   AtSign,
-  RefreshCw
+  RefreshCw,
+  MessageSquare,
+  Send
 } from 'lucide-react';
 import { Room, RoomEvent, Track } from 'livekit-client';
 import './App.css';
@@ -103,6 +105,29 @@ type CallStatus =
   | 'connecting'
   | 'connected'
   | 'error';
+
+type ChatUser = {
+  id: string;
+  name: string;
+  username: string | null;
+  online: boolean;
+};
+
+type ConversationItem = {
+  id: string;
+  other: ChatUser;
+  lastMessage: { body: string; createdAt: string } | null;
+  unread: number;
+};
+
+type ChatMessage = {
+  id: string;
+  senderId: string;
+  body: string;
+  createdAt: string;
+  readAt: string | null;
+  mine: boolean;
+};
 
 const API_URL = 'https://echo-mufe.onrender.com';
 const TOKEN_KEY = 'echo-auth-token';
@@ -183,6 +208,15 @@ function formatCallTime(value: string) {
     month: '2-digit',
     year: 'numeric'
   })}, ${time}`;
+}
+
+function formatMessageTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toLocaleTimeString('ru-RU', {
+    hour: '2-digit',
+    minute: '2-digit'
+  });
 }
 
 function cleanUsernameInput(value: string) {
@@ -965,6 +999,15 @@ function App() {
   const [connectionOnline, setConnectionOnline] = useState(false);
   const [busyAction, setBusyAction] = useState(false);
 
+  const [conversations, setConversations] = useState<ConversationItem[]>([]);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+  const [chatOther, setChatOther] = useState<ChatUser | null>(null);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatDraft, setChatDraft] = useState('');
+  const [chatBusy, setChatBusy] = useState(false);
+  const [chatError, setChatError] = useState('');
+  const chatBottomRef = useRef<HTMLDivElement | null>(null);
+
   const roomRef = useRef<Room | null>(null);
   const joiningCallIdRef = useRef('');
   const currentCallIdRef = useRef('');
@@ -1298,6 +1341,11 @@ function App() {
     setContacts([]);
     setCalls([]);
     setSearchResults([]);
+    setConversations([]);
+    setActiveConversationId(null);
+    setChatOther(null);
+    setChatMessages([]);
+    setChatDraft('');
     setIncomingCall(null);
     setSelectedContact(null);
     setCurrentCallId('');
@@ -1413,6 +1461,105 @@ function App() {
       }
     };
   }, []);
+
+  const refreshConversations = useCallback(async () => {
+    if (!localStorage.getItem(TOKEN_KEY)) return;
+    try {
+      const result = await getJson<{ conversations: ConversationItem[] }>(
+        '/api/conversations'
+      );
+      setConversations(result.conversations || []);
+    } catch (error) {
+      console.error('Не удалось загрузить чаты:', error);
+    }
+  }, []);
+
+  const loadMessages = useCallback(async (conversationId: string) => {
+    try {
+      const result = await getJson<{
+        conversationId: string;
+        other: ChatUser;
+        messages: ChatMessage[];
+      }>(`/api/conversations/${conversationId}/messages`);
+      setChatMessages(result.messages || []);
+      setChatOther(result.other);
+      setChatError('');
+    } catch (error) {
+      setChatError(
+        error instanceof Error ? error.message : 'Не удалось загрузить сообщения.'
+      );
+    }
+  }, []);
+
+  async function openChatWith(contact: Contact) {
+    setChatBusy(true);
+    setChatError('');
+    try {
+      const conv = await postJson<{ conversation: { id: string; other: ChatUser } }>(
+        '/api/conversations',
+        { userId: contact.id }
+      );
+      setActiveConversationId(conv.conversation.id);
+      setChatOther(conv.conversation.other);
+      setActiveTab('Чаты');
+      await loadMessages(conv.conversation.id);
+      await refreshConversations();
+    } catch (error) {
+      setCallError(
+        error instanceof Error ? error.message : 'Не удалось открыть чат.'
+      );
+    } finally {
+      setChatBusy(false);
+    }
+  }
+
+  async function sendChatMessage(event?: React.FormEvent) {
+    event?.preventDefault();
+    if (!activeConversationId || !chatDraft.trim() || chatBusy) return;
+    const body = chatDraft.trim();
+    setChatDraft('');
+    setChatBusy(true);
+    try {
+      const message = await postJson<{ message: ChatMessage }>(
+        `/api/conversations/${activeConversationId}/messages`,
+        { body }
+      );
+      setChatMessages((prev) => [...prev, message.message]);
+      await refreshConversations();
+    } catch (error) {
+      setChatError(
+        error instanceof Error ? error.message : 'Не удалось отправить.'
+      );
+      setChatDraft(body);
+    } finally {
+      setChatBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!authenticated || !userId) {
+      setConversations([]);
+      return;
+    }
+    void refreshConversations();
+    const timer = window.setInterval(() => {
+      void refreshConversations();
+    }, 4000);
+    return () => window.clearInterval(timer);
+  }, [authenticated, userId, refreshConversations]);
+
+  useEffect(() => {
+    if (!authenticated || !activeConversationId || activeTab !== 'Чаты') return;
+    void loadMessages(activeConversationId);
+    const timer = window.setInterval(() => {
+      void loadMessages(activeConversationId);
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [authenticated, activeConversationId, activeTab, loadMessages]);
+
+  useEffect(() => {
+    chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [chatMessages.length]);
 
   async function changeProfile() {
     const proposedName = window.prompt(
@@ -1671,6 +1818,19 @@ function App() {
             <Clock3 size={19} />
             <span>Недавние</span>
           </button>
+
+          <button
+            className={`nav-item ${activeTab === 'Чаты' ? 'active' : ''}`}
+            onClick={() => setActiveTab('Чаты')}
+          >
+            <MessageSquare size={19} />
+            <span>Чаты</span>
+            {conversations.some((c) => c.unread > 0) && (
+              <span className="nav-count">
+                {conversations.reduce((s, c) => s + (c.unread || 0), 0)}
+              </span>
+            )}
+          </button>
         </nav>
 
         <div className="sidebar-bottom">
@@ -1738,7 +1898,126 @@ function App() {
         </header>
 
         <div className="page-content">
-          {activeTab === 'Настройки' ? (
+          {activeTab === 'Чаты' ? (
+            <section className="chats-page">
+              <div className="page-heading">
+                <div>
+                  <div className="eyebrow">СООБЩЕНИЯ</div>
+                  <h1>Чаты</h1>
+                  <p>Личные переписки. История хранится на сервере.</p>
+                </div>
+              </div>
+
+              {chatError && (
+                <p className="chat-error" role="alert">
+                  {chatError}
+                </p>
+              )}
+
+              <div className="chats-layout">
+                <div className="chats-list">
+                  {conversations.length === 0 && (
+                    <div className="empty-state" style={{ border: 0 }}>
+                      Пока нет диалогов. Найди человека во вкладке «Контакты» и
+                      нажми «Написать».
+                    </div>
+                  )}
+                  {conversations.map((item) => (
+                    <button
+                      key={item.id}
+                      type="button"
+                      className={`chat-list-item ${
+                        activeConversationId === item.id ? 'active' : ''
+                      }`}
+                      onClick={() => {
+                        setActiveConversationId(item.id);
+                        setChatOther(item.other);
+                        void loadMessages(item.id);
+                      }}
+                    >
+                      <Avatar
+                        initials={initialsOf(item.other.name)}
+                        color={colorOf(item.other.id)}
+                        online={item.other.online}
+                      />
+                      <div className="meta">
+                        <strong>{item.other.name}</strong>
+                        <div className="preview">
+                          {item.lastMessage?.body ||
+                            (item.other.username
+                              ? `@${item.other.username}`
+                              : 'Нет сообщений')}
+                        </div>
+                      </div>
+                      {item.unread > 0 && (
+                        <span className="chat-unread">{item.unread}</span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="chat-thread">
+                  {activeConversationId && chatOther ? (
+                    <>
+                      <div className="chat-thread-header">
+                        <Avatar
+                          initials={initialsOf(chatOther.name)}
+                          color={colorOf(chatOther.id)}
+                          online={chatOther.online}
+                        />
+                        <div>
+                          <strong>{chatOther.name}</strong>
+                          <div className="preview">
+                            {chatOther.username
+                              ? `@${chatOther.username}`
+                              : chatOther.online
+                                ? 'В сети'
+                                : 'Не в сети'}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="chat-messages">
+                        {chatMessages.map((m) => (
+                          <div
+                            key={m.id}
+                            className={`chat-bubble ${m.mine ? 'mine' : 'theirs'}`}
+                          >
+                            {m.body}
+                            <time>{formatMessageTime(m.createdAt)}</time>
+                          </div>
+                        ))}
+                        <div ref={chatBottomRef} />
+                      </div>
+
+                      <form className="chat-compose" onSubmit={(e) => void sendChatMessage(e)}>
+                        <input
+                          value={chatDraft}
+                          onChange={(e) => setChatDraft(e.target.value)}
+                          placeholder="Напиши сообщение…"
+                          maxLength={4000}
+                          disabled={chatBusy}
+                        />
+                        <button
+                          type="submit"
+                          className="primary-button"
+                          disabled={chatBusy || !chatDraft.trim()}
+                          style={{ minWidth: 48, padding: '0 12px' }}
+                          aria-label="Отправить"
+                        >
+                          <Send size={18} />
+                        </button>
+                      </form>
+                    </>
+                  ) : (
+                    <div className="empty-state" style={{ border: 0, margin: 'auto' }}>
+                      Выбери диалог слева или напиши человеку из контактов.
+                    </div>
+                  )}
+                </div>
+              </div>
+            </section>
+          ) : activeTab === 'Настройки' ? (
             <section className="settings-page">
               <div className="page-heading">
                 <div>
@@ -1994,21 +2273,31 @@ function App() {
                           </span>
                         )}
 
-                        <button
-                          className="contact-call-button"
-                          disabled={
-                            busyAction || !userId || !contact.online
-                          }
-                          onClick={() => void startCall(contact)}
-                          title={
-                            contact.online
-                              ? 'Позвонить'
-                              : 'Пользователь не в сети'
-                          }
-                        >
-                          <PhoneCall size={17} />
-                          {contact.online ? 'Позвонить' : 'Не в сети'}
-                        </button>
+                        <div className="contact-actions">
+                          <button
+                            className="contact-call-button"
+                            disabled={chatBusy || !userId}
+                            onClick={() => void openChatWith(contact)}
+                          >
+                            <MessageSquare size={17} />
+                            Написать
+                          </button>
+                          <button
+                            className="contact-call-button"
+                            disabled={
+                              busyAction || !userId || !contact.online
+                            }
+                            onClick={() => void startCall(contact)}
+                            title={
+                              contact.online
+                                ? 'Позвонить'
+                                : 'Пользователь не в сети'
+                            }
+                          >
+                            <PhoneCall size={17} />
+                            {contact.online ? 'Позвонить' : 'Не в сети'}
+                          </button>
+                        </div>
                       </article>
                     ))}
 

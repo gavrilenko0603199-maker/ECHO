@@ -27,8 +27,11 @@
 
 body {
   margin: 0;
-  min-width: 900px;
+  min-width: 0;
   min-height: 100vh;
+  min-height: 100dvh;
+  background: var(--background);
+  overscroll-behavior: none;
 }
 
 button,
@@ -38,6 +41,7 @@ input {
 
 button {
   color: inherit;
+  cursor: pointer;
 }
 
 button:focus-visible,
@@ -46,13 +50,10 @@ input:focus-visible {
   outline-offset: 3px;
 }
 
-button {
-  cursor: pointer;
-}
-
 .app-shell {
   display: flex;
   min-height: 100vh;
+  min-height: 100dvh;
   background: var(--background);
 }
 
@@ -520,7 +521,7 @@ button {
   padding: 10px 12px;
   border: 1px solid #4a405c;
   border-radius: 10px;
-  background: #242031eF;
+  background: #242031ef;
   color: #e2dcef;
   box-shadow: 0 8px 30px #0003;
   font-size: 10px;
@@ -892,6 +893,11 @@ button {
   background: #38294c;
 }
 
+.contact-call-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .empty-state {
   grid-column: 1 / -1;
   padding: 50px 20px;
@@ -919,6 +925,13 @@ button {
   gap: 14px;
   padding: 19px;
   border-bottom: 1px solid #25242e;
+  width: 100%;
+  border-left: 0;
+  border-right: 0;
+  border-top: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
 }
 
 .settings-row:last-child {
@@ -1109,6 +1122,7 @@ button {
   letter-spacing: 2px;
 }
 
+/* ---------- tablet ---------- */
 @media (max-width: 1150px) {
   .sidebar {
     width: 220px;
@@ -1165,5 +1179,222 @@ button {
 
   .call-type {
     width: 90px;
+  }
+}
+
+/* ---------- iPhone / mobile ---------- */
+@media (max-width: 768px) {
+  .app-shell {
+    flex-direction: column;
+    min-height: 100dvh;
+    height: 100dvh;
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  .sidebar {
+    width: 100%;
+    flex-shrink: 0;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 14px;
+    border-right: none;
+    border-bottom: 1px solid #202027;
+  }
+
+  .brand {
+    margin-bottom: 0;
+    margin-right: auto;
+    font-size: 20px;
+    padding: 0;
+  }
+
+  .brand-icon {
+    width: 34px;
+    height: 34px;
+    border-radius: 11px;
+  }
+
+  .profile-card {
+    display: none;
+  }
+
+  .sidebar-label,
+  .connection-card,
+  .sidebar-footer {
+    display: none;
+  }
+
+  .navigation {
+    display: flex;
+    flex-direction: row;
+    width: 100%;
+    gap: 6px;
+    order: 3;
+  }
+
+  .nav-item {
+    flex: 1;
+    justify-content: center;
+    min-height: 42px;
+    padding: 0 6px;
+    font-size: 11px;
+    gap: 6px;
+  }
+
+  .nav-item > span:nth-child(2) {
+    display: none;
+  }
+
+  .sidebar-bottom {
+    margin-top: 0;
+    width: 100%;
+    display: flex;
+    gap: 6px;
+    order: 4;
+  }
+
+  .sidebar-bottom .nav-item {
+    flex: 1;
+  }
+
+  .main-content {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .topbar {
+    height: auto;
+    min-height: 52px;
+    padding: 10px 16px;
+    gap: 10px;
+  }
+
+  .connection-status {
+    display: none;
+  }
+
+  .page-content {
+    padding: 20px 16px 28px;
+  }
+
+  .page-heading {
+    flex-direction: column;
+    align-items: flex-start;
+    margin-bottom: 20px;
+  }
+
+  .page-heading h1 {
+    font-size: 26px;
+  }
+
+  .primary-button {
+    width: 100%;
+  }
+
+  .hero-card {
+    flex-direction: column;
+    align-items: flex-start;
+    min-height: 0;
+    padding: 22px 18px;
+    margin-bottom: 24px;
+  }
+
+  .hero-visual {
+    display: none;
+  }
+
+  .hero-content h2 {
+    font-size: 24px;
+  }
+
+  .section-header {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+  }
+
+  .search-box {
+    width: 100%;
+  }
+
+  .contacts-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .call-row {
+    flex-wrap: wrap;
+    min-height: 0;
+    padding: 12px 14px;
+    gap: 10px;
+  }
+
+  .call-type {
+    width: auto;
+  }
+
+  .call-duration {
+    width: auto;
+    margin-left: auto;
+  }
+
+  .call-action {
+    margin-left: 0;
+  }
+
+  .bottom-info {
+    flex-wrap: wrap;
+  }
+
+  .info-tag {
+    margin-left: auto;
+  }
+
+  .settings-row {
+    flex-wrap: wrap;
+    padding: 14px;
+  }
+
+  .settings-value {
+    width: 100%;
+    margin-top: 4px;
+    padding-left: 57px;
+  }
+
+  .call-overlay {
+    padding: 0;
+    align-items: flex-end;
+  }
+
+  .call-modal {
+    max-width: 100%;
+    width: 100%;
+    min-height: 70dvh;
+    border-radius: 20px 20px 0 0;
+    padding: 24px 20px calc(24px + env(safe-area-inset-bottom));
+  }
+
+  .call-controls {
+    gap: 28px;
+    margin-top: 36px;
+  }
+
+  .hangup-button {
+    width: 68px;
+    height: 68px;
+  }
+}
+
+@media (max-width: 380px) {
+  .page-heading h1 {
+    font-size: 22px;
+  }
+
+  .nav-item {
+    font-size: 10px;
   }
 }

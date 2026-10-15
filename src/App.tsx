@@ -1771,39 +1771,34 @@ function App() {
 
   return (
     <div className="app-shell">
-      <aside className="sidebar">
+      <aside className="sidebar desktop-only">
         <div className="brand">
           <div className="brand-icon">
-            <AudioLines size={23} strokeWidth={2.4} />
+            <AudioLines size={22} strokeWidth={2.4} />
           </div>
           <span>echo</span>
-          <div className="brand-status" />
         </div>
 
         <button className="profile-card" onClick={() => void changeProfile()}>
           <div className="profile-avatar">{initialsOf(myName)}</div>
           <div className="profile-info">
             <strong>{myName}</strong>
-            <span>
-              {myUsername ? `@${myUsername}` : 'Мой аккаунт'}
-            </span>
+            <span>{myUsername ? `@${myUsername}` : 'Мой аккаунт'}</span>
           </div>
-          <MoreHorizontal size={20} className="muted-icon" />
         </button>
-
-        <div className="sidebar-label">МЕНЮ</div>
 
         <nav className="navigation">
           <button
+            type="button"
             className={`nav-item ${activeTab === 'Звонки' ? 'active' : ''}`}
             onClick={() => setActiveTab('Звонки')}
           >
             <Phone size={19} />
             <span>Звонки</span>
-            <span className="nav-count">{calls.length}</span>
           </button>
 
           <button
+            type="button"
             className={`nav-item ${activeTab === 'Контакты' ? 'active' : ''}`}
             onClick={() => setActiveTab('Контакты')}
           >
@@ -1812,14 +1807,7 @@ function App() {
           </button>
 
           <button
-            className={`nav-item ${activeTab === 'Недавние' ? 'active' : ''}`}
-            onClick={() => setActiveTab('Недавние')}
-          >
-            <Clock3 size={19} />
-            <span>Недавние</span>
-          </button>
-
-          <button
+            type="button"
             className={`nav-item ${activeTab === 'Чаты' ? 'active' : ''}`}
             onClick={() => setActiveTab('Чаты')}
           >
@@ -1831,63 +1819,60 @@ function App() {
               </span>
             )}
           </button>
+
+          <button
+            type="button"
+            className={`nav-item ${activeTab === 'Недавние' ? 'active' : ''}`}
+            onClick={() => setActiveTab('Недавние')}
+          >
+            <Clock3 size={19} />
+            <span>Недавние</span>
+          </button>
         </nav>
 
         <div className="sidebar-bottom">
-          <div className="connection-card">
-            <div className="connection-icon">
-              <Headphones size={20} />
-            </div>
-            <div>
-              <strong>Твой голос. Твоя связь.</strong>
-              <span>Общайся без границ</span>
-            </div>
-          </div>
-
           <button
+            type="button"
             className={`nav-item ${activeTab === 'Настройки' ? 'active' : ''}`}
             onClick={() => setActiveTab('Настройки')}
           >
             <Settings size={19} />
             <span>Настройки</span>
           </button>
-
-          <button
-            className="nav-item"
-            onClick={() => void logout()}
-            disabled={loggingOut}
-            style={{ color: '#E5A5BC' }}
-          >
-            <LogOut size={19} />
-            <span>{loggingOut ? 'Выходим…' : 'Выйти из аккаунта'}</span>
-          </button>
-
-          <div className="sidebar-footer">
-            <span>Echo Desktop</span>
-            <span>v1.2.0</span>
-          </div>
         </div>
       </aside>
 
       <main className="main-content">
         <header className="topbar">
-          <div className="breadcrumb">
-            <span>Главная</span>
-            <span className="breadcrumb-divider">/</span>
-            <strong>{activeTab}</strong>
+          <div className="topbar-left">
+            <div className="brand mobile-only">
+              <div className="brand-icon">
+                <AudioLines size={18} strokeWidth={2.4} />
+              </div>
+              <span>echo</span>
+            </div>
+            <div className="breadcrumb desktop-only">
+              <strong>{activeTab}</strong>
+            </div>
           </div>
 
           <div className="topbar-right">
-            <div className="connection-status">
+            <div
+              className="connection-status desktop-only"
+              title={connectionOnline ? 'Онлайн' : 'Нет связи'}
+            >
               <span
                 className="status-dot"
                 style={{
                   background: connectionOnline ? '#48C78E' : '#E5A5BC'
                 }}
               />
-              {connectionOnline ? 'Сервер подключён' : 'Сервер недоступен'}
+              <span className="connection-text">
+                {connectionOnline ? 'Онлайн' : 'Офлайн'}
+              </span>
             </div>
             <button
+              type="button"
               className="icon-button"
               aria-label="Настройки"
               onClick={() => setActiveTab('Настройки')}
@@ -2095,6 +2080,21 @@ function App() {
                   </div>
                   <span className="settings-value">LiveKit</span>
                 </div>
+
+                <button
+                  type="button"
+                  className="settings-row settings-logout"
+                  onClick={() => void logout()}
+                  disabled={loggingOut}
+                >
+                  <div className="settings-icon settings-icon-danger">
+                    <LogOut size={21} />
+                  </div>
+                  <div>
+                    <strong>Выйти из аккаунта</strong>
+                    <p>Завершить сессию на этом устройстве</p>
+                  </div>
+                </button>
               </div>
             </section>
           ) : (
@@ -2390,6 +2390,42 @@ function App() {
           )}
         </div>
       </main>
+
+      <nav className="mobile-tabbar mobile-only" aria-label="Основное меню">
+        <button
+          type="button"
+          className={activeTab === 'Звонки' ? 'active' : ''}
+          onClick={() => setActiveTab('Звонки')}
+        >
+          <Phone size={22} />
+          <span>Звонки</span>
+        </button>
+        <button
+          type="button"
+          className={activeTab === 'Контакты' ? 'active' : ''}
+          onClick={() => setActiveTab('Контакты')}
+        >
+          <Users size={22} />
+          <span>Контакты</span>
+        </button>
+        <button
+          type="button"
+          className={activeTab === 'Чаты' ? 'active' : ''}
+          onClick={() => setActiveTab('Чаты')}
+        >
+          <MessageSquare size={22} />
+          <span>Чаты</span>
+          {conversations.some((c) => c.unread > 0) && <i className="tab-dot" />}
+        </button>
+        <button
+          type="button"
+          className={activeTab === 'Недавние' ? 'active' : ''}
+          onClick={() => setActiveTab('Недавние')}
+        >
+          <Clock3 size={22} />
+          <span>История</span>
+        </button>
+      </nav>
 
       {showCallWindow && selectedContact && (
         <div className="call-overlay">
